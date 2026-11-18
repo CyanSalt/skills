@@ -20,3 +20,5 @@ pnpm dlx skills add CyanSalt/skills --skill <skill-name>
 
 | Skill | Description |
 |-------|-------------|
+| [design-as-me](skills/design-as-me/SKILL.md) | Designs and refines pages using my personal design preferences. |
+| [design-as-them](skills/design-as-them/SKILL.md) | Creates a personalized `design-as-me` skill from the user's design preferences. |
