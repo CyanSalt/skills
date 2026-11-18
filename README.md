@@ -2,6 +2,8 @@
 
 [![AI-DECLARATION: auto](https://img.shields.io/badge/AI--DECLARATION-auto-ede9fe?labelColor=ede9fe)](https://ai-declaration.md)
 
+A collection of [Agent Skills](https://agentskills.io/home) created and used by me and AI agents.
+
 ## Installation
 
 Install all Skills from this repository:
