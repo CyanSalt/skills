@@ -11,5 +11,11 @@ These instructions apply to this repository and all of its subdirectories.
 - Write every Skill in this repository in English, including `SKILL.md`, references, and comments in bundled resources.
 - Every resource must be referenced from `SKILL.md`; delete any resource that is not referenced there.
 - JavaScript scripts bundled with a Skill must pass `oxlint` with no errors (`npx oxlint@latest <path>`).
-- Keep this file limited to repository-wide rules. Put Skill-specific
-  decisions, implementation constraints, and operational notes under `docs/`.
+- When creating, reviewing, or changing a Skill, read and follow [docs/0001-skill-authoring.md](docs/0001-skill-authoring.md).
+- Keep `SKILL.md` focused on what the executing agent needs: workflow, inputs, relevant prerequisites, side effects, result interpretation, limitations, and completion checks. Keep essential domain rules and output preferences explicit; do not add design history or maintenance explanations.
+- Keep configuration maps, exception lists, and dependency specifications in their maintained configuration or manifest. Link to them rather than copying their contents into `SKILL.md`; retain exact details only when needed to execute.
+- Use direct, conditional references for execution-time detail in the Skill's `references/` directory. State which bundled resources to run, read, or use; keep maintainer-only documents outside the Skill.
+- Verify changed behavior through the actual Skill entry point. Metadata validation and code linting do not replace execution checks.
+- Keep this file limited to repository-wide rules. Put Skill-specific decisions, implementation constraints, and maintenance notes in the repository-root `docs/` directory; do not include them in distributed Skill folders. For `lint-with-unicorn` maintenance, read [docs/0002-lint-with-unicorn-maintenance.md](docs/0002-lint-with-unicorn-maintenance.md).
+- Name Markdown files in the repository-root `docs/` directory as `NNNN-topic-name.md`, starting at `0001` and using the next available four-digit number. Preserve existing numbers and update references when moving or renaming files. Use descriptive names without required numbering in Skill `references/` directories.
+- Keep each Markdown paragraph or list item on one source line; do not hard-wrap prose at a fixed column width.
