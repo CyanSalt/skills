@@ -91,7 +91,7 @@ export function documentationSource(config, release) {
 
 export async function prepareRuntime(runtime, requirements, documentConfig, noInstall) {
   const resolutionFile = path.join(runtime, 'resolved-dependencies.json');
-  const loaderSource = new URL('runtime-loader.mjs', import.meta.url);
+  const loaderSource = new URL('../assets/runtime-loader.mjs', import.meta.url);
   const loaderFile = path.join(runtime, 'runtime-loader.mjs');
   async function syncLoader() {
     await using temporary = await mkdtempDisposable(path.join(runtime, '.loader-'));

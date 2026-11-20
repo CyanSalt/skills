@@ -39,7 +39,7 @@ Examples of placement:
 ## Scope and discovery
 
 - Match the frontmatter `name` to the directory name and follow the open specification's naming and length limits.
-- Write `description` in the third person. Include what the Skill does and explicit, concrete trigger conditions; the body is read after discovery.
+- Write `description` in the third person. Include what the Skill does and explicit, concrete trigger conditions; the body is read after discovery. Apply the pre-load information boundary in `AGENTS.md`: execution and result-review rules belong in the body or appropriate resources.
 - Keep the Skill focused on a coherent task. Do not claim adjacent capabilities or add unrelated workflows merely to broaden triggering.
 - Distinguish required behavior from defaults and optional choices. Do not turn one observed example into a hard-coded rule for all inputs.
 - Follow the intended host's supported metadata and capabilities. Do not import provider-specific fields, restrictions, packaging, or tool assumptions as universal repository requirements.

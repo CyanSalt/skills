@@ -2,7 +2,7 @@
 import {spawnSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {readFile, writeFile, mkdir, stat, realpath, mkdtempDisposable} from 'node:fs/promises';
-import {globSync} from 'node:fs';
+import {globSync, lstatSync} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
@@ -31,7 +31,8 @@ Exit: 0 no new findings (or no findings without baseline), 1 findings/unknowns,
 --fix applies all automatic fixes in selected files, including historical findings.
 Suggestions require AI review and are never applied automatically.
 Requires Node >=24.4, npm for metadata; prefers pnpm on PATH for installation.
-Git is required only for --base/--changed.
+Git is required for repository ignore filtering and --base/--changed.
+Non-Git projects can be checked without Git. Ignored files are never checked or fixed.
 Cache root: UNICORN_LINT_CACHE or the OS user cache directory.`;
 
 function run(command, arguments_, options = {}) {
@@ -55,13 +56,61 @@ function cacheRoot() {
   return path.join(process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), '.cache'), 'lint-with-unicorn');
 }
 
+function isWithin(directory, file) {
+  const relative = path.relative(directory, file);
+  return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+function repositoryFinder() {
+  const directories = new Map();
+  function find(directory) {
+    if (directories.has(directory)) return directories.get(directory);
+    let root;
+    if (lstatSync(path.join(directory, '.git'), {throwIfNoEntry: false})) {
+      root = git(directory, ['rev-parse', '--path-format=absolute', '--show-toplevel']).replace(/\r?\n$/u, '');
+      if (!path.isAbsolute(root) || !isWithin(root, directory)) throw new Error(`Invalid Git repository root: ${directory}`);
+    } else {
+      const parent = path.dirname(directory);
+      if (parent !== directory) root = find(parent);
+    }
+    directories.set(directory, root);
+    return root;
+  }
+  return find;
+}
+
+async function filterGitIgnored(files) {
+  const findRepository = repositoryFinder();
+  const groups = new Map();
+  for (const file of files) {
+    const root = findRepository(path.dirname(file));
+    if (!root) continue;
+    if (!groups.has(root)) groups.set(root, []);
+    groups.get(root).push(file);
+  }
+  const ignored = new Set();
+  for (const [root, candidates] of groups) {
+    const paths = candidates.map(file => path.relative(root, file).split(path.sep).join('/'));
+    const result = run('git', ['-C', root, 'check-ignore', '--stdin', '-z'], {input: `${paths.join('\0')}\0`});
+    if (![0, 1].includes(result.status) || result.signal) throw new Error(result.stderr.trim() || 'Git ignore filtering failed.');
+    for (const name of result.stdout.split('\0')) {
+      if (name) ignored.add(path.resolve(root, name));
+    }
+  }
+  const selected = await Promise.all(files.filter(file => !ignored.has(file)).map(file => realpath(file)));
+  return {
+    files: [...new Set(selected)].toSorted((left, right) => left.localeCompare(right)),
+    ignoredFiles: [...ignored].toSorted((left, right) => left.localeCompare(right)),
+  };
+}
+
 async function selectFiles(inputs, cwd) {
   const found = new Set();
   async function add(file, explicit) {
     const info = await stat(file);
     if (info.isDirectory()) {
       const matches = globSync('**/*', {
-        cwd: file, exclude: ['**/node_modules/**', '**/.git/**'], withFileTypes: true,
+        cwd: await realpath(file), exclude: ['**/node_modules/**', '**/.git/**'], withFileTypes: true,
       });
       for (const match of matches) {
         if (match.isFile() && profileFor(match.name)) found.add(path.resolve(match.parentPath, match.name));
@@ -73,8 +122,7 @@ async function selectFiles(inputs, cwd) {
       if (explicit) throw new Error(`Unsupported extension: ${file}`);
       return;
     }
-    const source = await realpath(file);
-    found.add(source);
+    found.add(file);
   }
   for (const input of inputs) {
     const absolute = path.resolve(cwd, input);
@@ -83,7 +131,7 @@ async function selectFiles(inputs, cwd) {
     if (matches.length === 0) throw new Error(`No files match: ${input}`);
     for (const match of matches) await add(path.resolve(cwd, match), false);
   }
-  return [...new Set(await Promise.all([...found].map(file => realpath(file))))].toSorted((left, right) => left.localeCompare(right));
+  return [...found].toSorted((left, right) => left.localeCompare(right));
 }
 
 async function lintBatch(files, cwd, runtime, selected, options, configHash, cacheLabel) {
@@ -168,12 +216,25 @@ async function main() {
     });
     files = [...new Set(files)].toSorted((left, right) => left.localeCompare(right));
   }
-  if (files.length === 0 && !options.changed) throw new Error('No supported files selected. Supply files, globs, or directories.');
+  const {files: eligibleFiles, ignoredFiles} = await filterGitIgnored(files);
+  files = eligibleFiles;
+  if (files.length === 0 && ignoredFiles.length === 0 && !options.changed) throw new Error('No supported files selected. Supply files, globs, or directories.');
+  const selection = {ignoredFiles};
+  if (files.length === 0) {
+    const output = {files: [], summary: {new: 0, existing: 0, unknown: 0, total: 0}, baseline: base?.commit ?? null,
+      selection, checked: false, reason: ignoredFiles.length > 0 ? 'All selected files are ignored by Git.' : 'No supported changed files.'};
+    if (options.format === 'json') process.stdout.write(`${JSON.stringify(output)}\n`);
+    else {
+      for (const file of ignoredFiles) process.stdout.write(`Skipped Git-ignored file: ${JSON.stringify(path.relative(cwd, file))}\n`);
+      process.stdout.write(`No files checked. ${output.reason}\n`);
+    }
+    return;
+  }
   const selected = [...new Set(files.map(file => profileFor(file)))].toSorted((left, right) => left.localeCompare(right));
   const manifest = JSON.parse(await readFile(path.join(skill, 'assets', 'dependencies.json'), 'utf8'));
   const configHash = hash(JSON.stringify(manifest) + await readFile(path.join(skill, 'assets', 'eslint.config.mjs'), 'utf8')
     + await readFile(path.join(skill, 'assets', 'profiles.mjs'), 'utf8')
-    + await readFile(path.join(skill, 'scripts', 'runtime-loader.mjs'), 'utf8'));
+    + await readFile(path.join(skill, 'assets', 'runtime-loader.mjs'), 'utf8'));
   const sources = new Map(await Promise.all(files.map(async file => [file, await readFile(file, 'utf8')])));
   if (options.snapshot) {
     const target = path.resolve(cwd, options.snapshot);
@@ -185,7 +246,7 @@ async function main() {
       entries[file] = name;
     }
     await writeFile(path.join(target, 'snapshot.json'), JSON.stringify({version: 1, cwd, configHash, entries}, undefined, 2));
-    process.stdout.write(`${JSON.stringify({snapshot: target, files: files.length})}\n`);
+    process.stdout.write(`${JSON.stringify({snapshot: target, files: files.length, selection})}\n`);
     return;
   }
   let saved;
@@ -194,10 +255,6 @@ async function main() {
     snapshotRoot = await realpath(path.resolve(cwd, options.baseline));
     saved = JSON.parse(await readFile(path.join(snapshotRoot, 'snapshot.json'), 'utf8'));
     if (saved.version !== 1 || saved.configHash !== configHash || saved.cwd !== cwd) throw new Error('Snapshot root or skill configuration differs; comparison would be unreliable.');
-  }
-  if (files.length === 0) {
-    process.stdout.write(options.format === 'json' ? `${JSON.stringify({files: [], summary: {new: 0, existing: 0, unknown: 0, total: 0}, baseline: base.commit})}\n` : 'No supported changed files.\n');
-    return;
   }
   const runtime = path.join(cacheRoot(), 'runtimes', hash(JSON.stringify(manifest)));
   const needed = Object.assign({}, manifest.core, ...selected.map(name => manifest[name] ?? {}));
@@ -287,11 +344,12 @@ async function main() {
     suggestionCount: outputFiles.reduce((count, file) => count + file.messages.reduce((total, message) => total + (message.suggestions?.length ?? 0), 0), 0),
     documentationPath: documentation.readme,
     rulesDocumentationPath: documentation.rules,
-    nextStep: `The agent must independently decide whether each in-scope finding is worth fixing based on benefit, behavior/API compatibility, and change risk; retain intentional or low-value patterns with a concrete reason. Review --fix --dry-run first; apply --fix only when every proposed change is worthwhile and authorized. Read documentationPath or documentationUrl when needed and review messages[].suggestions before manual edits and recheck. Unicorn documentation: ${documentation.readme}. Suggestions are alternatives, not automatic fixes. Preview ranges refer to output, not the original file.`,
+    nextStep: `Lint findings are quality references; fixing every finding or producing a clean report is not required. The agent must independently decide whether each in-scope finding is worth fixing based on benefit, behavior/API compatibility, and change risk; retain intentional or low-value patterns with a concrete reason. Review --fix --dry-run first; apply --fix only when every proposed change is worthwhile and authorized. Read documentationPath or documentationUrl when needed and review messages[].suggestions before manual edits and recheck. Unicorn documentation: ${documentation.readme}. Suggestions are alternatives, not automatic fixes. Preview ranges refer to output, not the original file.`,
   };
-  const output = {version: 1, configHash: runtimeConfigHash, versions, baseline: base?.commit ?? (saved ? snapshotRoot : null), profiles: selected, summary, repair, files: outputFiles};
+  const output = {version: 1, configHash: runtimeConfigHash, versions, baseline: base?.commit ?? (saved ? snapshotRoot : null), profiles: selected, selection, checked: true, summary, repair, files: outputFiles};
   if (options.format === 'json') process.stdout.write(`${JSON.stringify(output, undefined, 2)}\n`);
   else {
+    for (const file of ignoredFiles) process.stdout.write(`Skipped Git-ignored file: ${JSON.stringify(path.relative(cwd, file))}\n`);
     for (const file of outputFiles) {
       for (const message of file.messages) {
         process.stdout.write(

@@ -184,7 +184,7 @@ export default function importDependency() {
     assert.ok(!next.stderr.includes('Installing isolated dependencies'));
     const runtime = path.join(coldCache, 'runtimes', runtimes[0]);
     const loaderFile = path.join(runtime, 'runtime-loader.mjs');
-    const loaderSource = await readFile(new URL('runtime-loader.mjs', import.meta.url), 'utf8');
+    const loaderSource = await readFile(new URL('../assets/runtime-loader.mjs', import.meta.url), 'utf8');
     assert.equal(await readFile(loaderFile, 'utf8'), loaderSource);
     await writeFile(loaderFile, 'throw new Error("Corrupt loader must not execute");\n');
     const invalidLoader = execute(['--no-install', '--', 'sample.js'], environment);
@@ -328,6 +328,136 @@ assert.equal(typeof module.diffLines, 'function');
       }
     }
   });
+  await test('Git ignores apply equally to explicit files, directories and globs while tracked files remain eligible', async () => {
+    await using temporary = await mkdtempDisposable(path.join(root, 'git-ignore-'));
+    const project = temporary.path;
+    const command = (...arguments_) => {
+      const result = spawnSync('git', ['-C', project, ...arguments_], {encoding: 'utf8', shell: false});
+      assert.equal(result.status, 0, result.stderr);
+      return result.stdout;
+    };
+    command('init', '--quiet');
+    await mkdir(path.join(project, 'src'));
+    await mkdir(path.join(project, 'dist'));
+    await writeFile(path.join(project, '.gitignore'), '/dist/\n*.generated.js\nsrc/*.tmp.js\n');
+    await writeFile(path.join(project, 'src', '.gitignore'), '!keep.tmp.js\n');
+    await writeFile(path.join(project, '.git', 'info', 'exclude'), 'local.js\n');
+    const globalIgnore = path.join(temporary.path, 'global-ignore');
+    await writeFile(globalIgnore, 'global.js\n');
+    command('config', 'core.excludesFile', globalIgnore);
+    const ignored = ['dist/invalid.json', 'src/a.tmp.js', 'local.js', 'global.js', 'line\nbreak.generated.js'];
+    const included = ['plain.js', 'src/keep.tmp.js', 'tracked.generated.js', 'line\nbreak.js'];
+    for (const name of [...ignored, ...included]) await writeFile(path.join(project, name), name.endsWith('.json') ? 'Invalid JSON' : code);
+    command('add', '-f', '--', 'tracked.generated.js');
+    const index = await readFile(path.join(project, '.git', 'index'));
+    for (const inputs of [[...ignored, ...included], ['.'], ['**/*']]) {
+      const output = resultOf(['--cwd', project, '--no-install', '--', ...inputs], 1);
+      assert.deepEqual(output.files.map(file => path.relative(project, file.filePath)), included.toSorted((left, right) => left.localeCompare(right)));
+      assert.deepEqual(output.profiles, ['javascript']);
+      assert.deepEqual(new Set(output.selection.ignoredFiles), new Set(ignored.map(name => path.join(project, name))));
+      assert.equal(output.checked, true);
+    }
+    const empty = execute(['--cwd', project, '--no-install', '--', ...ignored], {...process.env, UNICORN_LINT_CACHE: path.join(root, 'ignore-empty-cache')});
+    assert.equal(empty.status, 0, empty.stderr);
+    const emptyOutput = JSON.parse(empty.stdout);
+    assert.equal(emptyOutput.checked, false);
+    assert.match(emptyOutput.reason, /All selected files are ignored by Git/u);
+    assert.deepEqual(emptyOutput.files, []);
+    const text = execute(['--cwd', project, '--no-install', '--format', 'text', '--', 'plain.js', 'local.js']);
+    assert.equal(text.status, 1, text.stderr);
+    assert.match(text.stdout, /Skipped Git-ignored file: "local.js"/u);
+    if (process.platform !== 'win32') {
+      const noGit = path.join(temporary.path, 'no-git-bin');
+      await mkdir(noGit);
+      const nonGit = execute(['--no-install', '--', 'sample.js'], {...process.env, PATH: noGit});
+      assert.equal(nonGit.status, 1, nonGit.stderr);
+      const unavailable = execute(['--cwd', project, '--no-install', '--', 'plain.js'], {...process.env, PATH: noGit});
+      assert.equal(unavailable.status, 2);
+      assert.match(unavailable.stderr, /ENOENT/u);
+      const link = path.join(project, 'ignored.generated.js');
+      await symlink(path.join(project, 'plain.js'), link);
+      const skippedLink = resultOf(['--cwd', project, '--no-install', '--', 'ignored.generated.js'], 0);
+      assert.equal(skippedLink.checked, false);
+      assert.deepEqual(skippedLink.selection.ignoredFiles, [link]);
+    }
+    assert.deepEqual(await readFile(path.join(project, '.git', 'index')), index);
+  });
+  await test('Git filtering is shared by snapshots, baseline checks, changed selection and repairs', async () => {
+    await using temporary = await mkdtempDisposable(path.join(root, 'git-ignore-workflow-'));
+    const project = temporary.path;
+    const command = (...arguments_) => {
+      const result = spawnSync('git', ['-C', project, ...arguments_], {encoding: 'utf8', shell: false});
+      assert.equal(result.status, 0, result.stderr);
+      return result.stdout;
+    };
+    command('init', '--quiet');
+    const source = '[Example](http://example.com)\n';
+    await writeFile(path.join(project, '.gitignore'), 'ignored.md\n');
+    for (const name of ['checked.md', 'ignored.md']) await writeFile(path.join(project, name), source);
+    command('add', '--', '.');
+    command('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', '-m', 'Baseline');
+    const index = await readFile(path.join(project, '.git', 'index'));
+    const snapshot = path.join(root, 'git-ignore-before');
+    const captured = resultOf(['--cwd', project, '--snapshot', snapshot, '--', '*.md'], 0);
+    assert.equal(captured.files, 1);
+    const metadata = JSON.parse(await readFile(path.join(snapshot, 'snapshot.json'), 'utf8'));
+    assert.deepEqual(Object.keys(metadata.entries), [path.join(project, 'checked.md')]);
+    for (const baseline of [['--baseline', snapshot], ['--base', 'HEAD']]) {
+      const compared = resultOf(['--cwd', project, ...baseline, '--no-install', '--', '*.md'], 0);
+      assert.equal(compared.files.length, 1);
+      assert.ok(compared.summary.existing > 0);
+    }
+    await writeFile(path.join(project, 'checked.md'), `# Changed\n\n${source}`);
+    const changed = resultOf(['--cwd', project, '--base', 'HEAD', '--changed', '--no-install'], 0);
+    assert.deepEqual(changed.files.map(file => path.basename(file.filePath)), ['checked.md']);
+    const preview = resultOf(['--cwd', project, '--baseline', snapshot, '--fix', '--dry-run', '--no-install', '--', '*.md'], 0);
+    assert.deepEqual(preview.repair.fixedFiles, [path.join(project, 'checked.md')]);
+    assert.equal(await readFile(path.join(project, 'ignored.md'), 'utf8'), source);
+    const applied = resultOf(['--cwd', project, '--baseline', snapshot, '--fix', '--no-install', '--', '*.md'], 0);
+    assert.deepEqual(applied.repair.fixedFiles, [path.join(project, 'checked.md')]);
+    assert.equal(await readFile(path.join(project, 'ignored.md'), 'utf8'), source);
+    assert.deepEqual(await readFile(path.join(project, '.git', 'index')), index);
+    const emptySnapshot = path.join(root, 'ignored-only-snapshot');
+    const skipped = resultOf(['--cwd', project, '--snapshot', emptySnapshot, '--', 'ignored.md'], 0);
+    assert.equal(skipped.checked, false);
+    const rootEntries = await readdir(root);
+    assert.ok(!rootEntries.includes('ignored-only-snapshot'));
+  });
+  await test('nested repositories and worktrees use their own Git ignores and Git failures are not hidden', async () => {
+    await using temporary = await mkdtempDisposable(path.join(root, 'git-ignore-repositories-'));
+    const project = temporary.path;
+    const command = (cwd, ...arguments_) => {
+      const result = spawnSync('git', ['-C', cwd, ...arguments_], {encoding: 'utf8', shell: false});
+      assert.equal(result.status, 0, result.stderr);
+      return result.stdout;
+    };
+    command(project, 'init', '--quiet');
+    await writeFile(path.join(project, '.gitignore'), 'nested/\n');
+    await writeFile(path.join(project, 'plain.js'), code);
+    command(project, 'add', '--', '.');
+    command(project, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', '-m', 'Baseline');
+    const nested = path.join(project, 'nested');
+    await mkdir(nested);
+    command(nested, 'init', '--quiet');
+    await writeFile(path.join(nested, '.gitignore'), 'ignored.js\n');
+    for (const name of ['plain.js', 'ignored.js']) await writeFile(path.join(nested, name), code);
+    const output = resultOf(['--cwd', project, '--no-install', '--', '.'], 1);
+    assert.deepEqual(new Set(output.files.map(file => file.filePath)), new Set([path.join(project, 'plain.js'), path.join(nested, 'plain.js')]));
+    assert.deepEqual(output.selection.ignoredFiles, [path.join(nested, 'ignored.js')]);
+    const worktree = path.join(root, 'ignore-worktree');
+    command(project, 'worktree', 'add', '--quiet', '--detach', worktree);
+    await writeFile(path.join(worktree, '.gitignore'), 'ignored.js\n');
+    await writeFile(path.join(worktree, 'ignored.js'), code);
+    const worktreeOutput = resultOf(['--cwd', worktree, '--no-install', '--', '.'], 1);
+    assert.deepEqual(worktreeOutput.files.map(file => path.basename(file.filePath)), ['plain.js']);
+    const corrupt = path.join(project, 'corrupt');
+    await mkdir(corrupt);
+    await writeFile(path.join(corrupt, '.git'), 'gitdir: missing-directory\n');
+    await writeFile(path.join(corrupt, 'plain.js'), code);
+    const failed = execute(['--cwd', corrupt, '--no-install', '--', 'plain.js']);
+    assert.equal(failed.status, 2);
+    assert.match(failed.stderr, /not a git repository/u);
+  });
   await test('non-script recommended presets cover every rule and preserve profiles and dialects', async () => {
     const cases = [
       {name: 'recommended.css', source: 'a { unknown-property: 1; }\n', rule: 'css/no-invalid-properties', namespace: 'css/'},
@@ -461,6 +591,7 @@ for (const file of ['sample.js', 'sample.ts', 'sample.vue', 'sample.html']) {
         }
       }
       assert.match(output.repair.nextStep, /independently decide.*worth fixing/u);
+      assert.match(output.repair.nextStep, /quality references.*clean report is not required/u);
       const text = execute(['--no-install', '--format', 'text', '--', 'core-check.js']);
       assert.equal(text.status, 1);
       assert.match(text.stdout, /Rule documentation: https:/u);
