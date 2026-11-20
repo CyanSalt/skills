@@ -4,8 +4,39 @@ import {mkdir, readFile, writeFile, rm} from 'node:fs/promises';
 import path from 'node:path';
 import {documentationReady, prepareDocumentation} from './documentation.mjs';
 
-const exec = promisify(execFile);
+const execFileAsync = promisify(execFile);
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+const pnpm = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
+
+function preferredInstaller() {
+  try {
+    execFileSync(pnpm, ['--version'], {shell: false, encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe']});
+    return pnpm;
+  } catch (error) {
+    if (error.code === 'ENOENT') return npm;
+    throw error;
+  }
+}
+
+async function installDependencies(runtime, packages) {
+  const installer = preferredInstaller();
+  let arguments_;
+  if (installer === pnpm) {
+    // Keep registry routes consistent with npm-based version discovery, including scoped registries.
+    const {stdout} = await execFileAsync(npm, ['config', 'list', '--json'], {shell: false, encoding: 'utf8', timeout: 10_000});
+    const registryOptions = Object.entries(JSON.parse(stdout))
+      .filter(([key, value]) => /^(?:@[^:]+:)?registry$/u.test(key) && typeof value === 'string')
+      .map(([key, value]) => `--${key}=${value}`);
+    arguments_ = ['--dir', runtime, 'add', '--save-exact', '--ignore-scripts', '--ignore-workspace',
+      '--ignore-pnpmfile', '--prefer-offline', ...registryOptions, ...packages];
+  } else {
+    arguments_ = ['install', '--prefix', runtime, '--save-exact', '--ignore-scripts', '--no-audit', '--no-fund', ...packages];
+  }
+  process.stderr.write(`Installing isolated dependencies with ${installer}: ${packages.join(', ')}\n`);
+  execFileSync(installer, arguments_, {
+    shell: false, encoding: 'utf8', timeout: 180_000, maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
 
 async function readJson(file) {
   try {return JSON.parse(await readFile(file, 'utf8'));} catch (error) {
@@ -28,15 +59,15 @@ export async function resolveDependencies(requirements) {
   const entries = await Promise.all(Object.entries(requirements).map(async ([name, spec]) => {
     if (typeof spec !== 'string' || !spec.trim()) throw new Error(`Invalid dependency specification: ${name}`);
     const query = spec === '*' ? [name, 'versions'] : [`${name}@${spec}`, 'version'];
-    const {stdout} = await exec(npm, ['view', ...query, '--json', '--prefer-online'], {
-      encoding: 'utf8', timeout: 90_000, maxBuffer: 8 * 1024 * 1024,
+    const {stdout} = await execFileAsync(npm, ['view', ...query, '--json', '--prefer-online'], {
+      shell: false, encoding: 'utf8', timeout: 90_000, maxBuffer: 8 * 1024 * 1024,
     });
     const version = highestStableVersion(JSON.parse(stdout));
     if (!version) throw new Error(`npm did not resolve a stable version for ${name}@${spec}.`);
     let gitHead;
     if (name === 'eslint-plugin-unicorn') {
-      const commit = await exec(npm, ['view', `${name}@${version}`, 'gitHead', '--json', '--prefer-online'], {
-        encoding: 'utf8', timeout: 90_000, maxBuffer: 1024 * 1024,
+      const commit = await execFileAsync(npm, ['view', `${name}@${version}`, 'gitHead', '--json', '--prefer-online'], {
+        shell: false, encoding: 'utf8', timeout: 90_000, maxBuffer: 1024 * 1024,
       });
       gitHead = JSON.parse(commit.stdout || 'null');
     }
@@ -96,10 +127,7 @@ export async function prepareRuntime(runtime, requirements, documentConfig, noIn
     if (packages.length > 0) {
       const packageFile = path.join(runtime, 'package.json');
       if (!await readJson(packageFile)) await writeFile(packageFile, JSON.stringify({private: true, type: 'module'}));
-      process.stderr.write(`Installing isolated dependencies: ${packages.join(', ')}\n`);
-      execFileSync(npm, ['install', '--prefix', runtime, '--save-exact', '--ignore-scripts', '--no-audit', '--no-fund', ...packages], {
-        encoding: 'utf8', timeout: 180_000, maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
-      });
+      await installDependencies(runtime, packages);
     }
     if (!await ready(resolved)) throw new Error('Installed runtime differs from resolved versions.');
     await prepareDocumentation(runtime, documentationSource(documentConfig, resolved[documentConfig.package]));

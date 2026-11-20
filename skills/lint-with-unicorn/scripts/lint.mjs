@@ -31,7 +31,8 @@ Exit: 0 no new findings (or no findings without baseline), 1 findings/unknowns,
       2 setup, selection, configuration or parsing failure. Source writes require --fix.
 --fix applies all automatic fixes in selected files, including historical findings.
 Suggestions require AI review and are never applied automatically.
-Requires Node >=22.13 (22.x), or >=24, npm; Git only for --base/--changed.
+Requires Node >=22.13 (22.x), or >=24, npm for metadata; prefers pnpm on PATH for installation.
+Git is required only for --base/--changed.
 Cache root: UNICORN_LINT_CACHE or the OS user cache directory.`;
 
 function run(command, arguments_, options = {}) {

@@ -9,7 +9,7 @@ Run [scripts/lint.mjs](scripts/lint.mjs) to check and repair the requested files
 
 ## Requirements
 
-- Node 22.13+ on the 22.x line, or Node 24+, and npm.
+- Node 22.13+ on the 22.x line, or Node 24+, and npm for registry metadata. Put pnpm on `PATH` for preferred dependency installation; npm is used only when pnpm is unavailable. Installation failures are reported without switching installers. Both installers disable lifecycle scripts and use the npm registry configuration; pnpm reuses its shared package store.
 - Git for `--base` and `--changed`.
 - Normal runs query the npm registry and select stable versions satisfying the bundled dependency requirements. Matching Unicorn documentation is prepared outside the project. `--no-install` prohibits registry queries, updates, and documentation downloads and reuses cached resolved versions; missing or invalid prerequisites are errors. To keep a repair/recheck sequence on the same dependency versions, prepare once and use `--no-install` afterward.
 

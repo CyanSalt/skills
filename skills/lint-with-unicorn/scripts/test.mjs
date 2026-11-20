@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
 import {spawnSync} from 'node:child_process';
-import {mkdtemp, writeFile, readFile, mkdir, rm, rename, readdir, realpath} from 'node:fs/promises';
+import {mkdtemp, writeFile, readFile, mkdir, rm, rename, readdir, realpath, chmod, symlink} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -73,13 +73,72 @@ try {
     assert.equal(documentationSource(config, newRelease).archiveUrl, `${config.archiveBaseUrl}/${newRelease.gitHead}`);
     assert.throws(() => documentationSource(config, {version: '81.0.0'}), /gitHead/u);
   });
+  await test('entry point prefers pnpm, preserves registry routes, and never retries failed installers', {skip: process.platform === 'win32'}, async () => {
+    const bin = path.join(root, 'installer-bin');
+    const log = path.join(root, 'installer-calls.jsonl');
+    await mkdir(bin);
+    const shim = path.join(bin, 'package-manager.mjs');
+    await writeFile(shim, `import {appendFileSync} from 'node:fs';
+const [manager, ...args] = process.argv.slice(2);
+appendFileSync(process.env.INSTALLER_LOG, JSON.stringify({manager, args}) + '\\n');
+if (args[0] === '--version') {
+  if (process.env.FAIL_PNPM_PROBE) process.exit(43);
+  console.log('11.0.0');
+} else if (args[0] === 'view') {
+  console.log(JSON.stringify(args.includes('gitHead') ? 'a'.repeat(40) : ['1.0.0']));
+} else if (args[0] === 'config') {
+  console.log(JSON.stringify({registry: 'https://registry.example.invalid/', '@typescript-eslint:registry': 'https://scoped.example.invalid/'}));
+} else {
+  process.exit(manager === 'pnpm' ? 42 : 41);
+}
+`);
+    const wrapper = manager => `#!/bin/sh\nexec "${process.execPath}" "${shim}" ${manager} "$@"\n`;
+    for (const manager of ['npm', 'pnpm']) {
+      await writeFile(path.join(bin, manager), wrapper(manager));
+      await chmod(path.join(bin, manager), 0o755);
+    }
+    await symlink(process.execPath, path.join(bin, 'node'));
+    const environment = {...process.env, PATH: bin, INSTALLER_LOG: log, UNICORN_LINT_CACHE: path.join(root, 'installer-cache')};
+    const calls = async () => (await readFile(log, 'utf8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+    const preferred = execute(['--', 'sample.ts'], environment);
+    assert.equal(preferred.status, 2);
+    assert.match(preferred.stderr, /Installing isolated dependencies with pnpm/u);
+    const preferredCalls = await calls();
+    const install = preferredCalls.find(call => call.manager === 'pnpm' && call.args.includes('add'));
+    assert.ok(install);
+    assert.ok(install.args.includes('--registry=https://registry.example.invalid/'));
+    assert.ok(install.args.includes('--@typescript-eslint:registry=https://scoped.example.invalid/'));
+    assert.ok(install.args.includes('--ignore-scripts'));
+    assert.ok(install.args.includes('--ignore-pnpmfile'));
+    assert.ok(install.args.includes('--ignore-workspace'));
+    assert.ok(install.args.includes('--prefer-offline'));
+    assert.ok(!preferredCalls.some(call => call.manager === 'npm' && call.args.includes('install')));
+    await writeFile(log, '');
+    const failedProbe = execute(['--', 'sample.js'], {...environment, FAIL_PNPM_PROBE: '1'});
+    assert.equal(failedProbe.status, 2);
+    assert.ok(!(await calls()).some(call => call.args.includes('install') || call.args.includes('add')));
+    await rm(path.join(bin, 'pnpm'));
+    await writeFile(log, '');
+    const fallback = execute(['--', 'sample.js'], environment);
+    assert.equal(fallback.status, 2);
+    assert.match(fallback.stderr, /Installing isolated dependencies with npm/u);
+    const fallbackInstall = (await calls()).find(call => call.manager === 'npm' && call.args.includes('install'));
+    assert.ok(fallbackInstall.args.includes('--ignore-scripts'));
+    await writeFile(log, '');
+    const offline = execute(['--no-install', '--', 'sample.js'], environment);
+    assert.equal(offline.status, 2);
+    assert.deepEqual(await calls(), []);
+  });
   await test('cold JavaScript installation needs no optional language packages and is reused offline', async () => {
     const coldCache = path.join(root, 'cold-cache');
     const environment = {...process.env, UNICORN_LINT_CACHE: coldCache};
     const first = execute(['--', 'sample.js'], environment);
     assert.equal(first.status, 1, first.stderr);
     assert.match(first.stderr, /Installing isolated dependencies/u);
+    const hasPnpm = spawnSync(process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm', ['--version'], {encoding: 'utf8'}).status === 0;
+    if (hasPnpm) assert.match(first.stderr, /Installing isolated dependencies with pnpm/u);
     const runtimes = await readdir(path.join(coldCache, 'runtimes'));
+    if (hasPnpm) assert.ok((await readdir(path.join(coldCache, 'runtimes', runtimes[0]))).includes('pnpm-lock.yaml'));
     const installed = JSON.parse(await readFile(path.join(coldCache, 'runtimes', runtimes[0], 'package.json'), 'utf8'));
     assert.deepEqual(Object.keys(installed.dependencies).toSorted((left, right) => left.localeCompare(right)), ['diff', 'eslint', 'eslint-plugin-unicorn', 'tar']);
     const next = execute(['--no-install', '--', 'sample.js'], environment);
