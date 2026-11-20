@@ -11,15 +11,14 @@ const {default: importDependency} = await import(pathToFileURL(path.join(runtime
 const selected = new Set(JSON.parse(process.env.UNICORN_LINT_PROFILES ?? '[]'));
 
 // Load optional dependencies only for the selected file types.
-const {defineConfig} = await importDependency('eslint/config');
+const {defineConfig, globalIgnores} = await importDependency('eslint/config');
 const {default: unicorn} = await importDependency('eslint-plugin-unicorn');
 const hasScripts = selected.has('javascript') || selected.has('typescript') || selected.has('vue');
 const js = hasScripts ? (await importDependency('@eslint/js')).default : undefined;
 const globals = hasScripts ? (await importDependency('globals')).default : undefined;
 const tseslint = selected.has('typescript') || selected.has('vue') ? await importDependency('typescript-eslint') : undefined;
-// Scope every official strict block through our outer profile, including Vue and nonstandard suffixes.
-const tsStrict = tseslint?.configs.strict.map(configuration => ({...configuration, files: undefined}));
-const tsParser = tseslint?.parser;
+// Apply strict's TS compatibility overrides to Vue scripts and every supported TS suffix.
+const tsStrict = tseslint?.configs.strict.map(({files: _files, ...configuration}) => configuration);
 const vueParser = selected.has('vue') ? (await importDependency('vue-eslint-parser')).default : undefined;
 const css = selected.has('css') ? (await importDependency('@eslint/css')).default : undefined;
 const html = selected.has('html') ? (await importDependency('@html-eslint/eslint-plugin')).default : undefined;
@@ -29,23 +28,21 @@ const toml = selected.has('toml') ? (await importDependency('eslint-plugin-toml'
 const yml = selected.has('yaml') ? (await importDependency('eslint-plugin-yml')).default : undefined;
 
 export default defineConfig([
+  globalIgnores(['**/node_modules/**', '**/.git/**'], 'lint-as-if-perfect/ignores'),
   {
-    name: 'unicorn-audit/isolation',
+    name: 'lint-as-if-perfect/isolation',
     linterOptions: {
       noInlineConfig: true,
       reportUnusedDisableDirectives: 'off',
     },
-    ignores: ['**/node_modules/**', '**/.git/**'],
   },
 
   // JavaScript and JSX.
   selected.has('javascript') && {
-    ...unicorn.configs.recommended,
-    extends: [js.configs.recommended],
-    name: 'unicorn-audit/javascript',
+    extends: [js.configs.recommended, unicorn.configs.recommended],
+    name: 'lint-as-if-perfect/javascript',
     files: patternsFor('javascript'),
     languageOptions: {
-      ...unicorn.configs.recommended.languageOptions,
       // Without project configuration, accept both standard browser and Node globals.
       globals: {...globals.builtin, ...globals.browser, ...globals.node},
       ecmaVersion: 'latest',
@@ -60,17 +57,14 @@ export default defineConfig([
 
   // TypeScript, TSX, and declaration files; parsing without a type-checking project.
   selected.has('typescript') && {
-    ...unicorn.configs.recommended,
-    extends: [js.configs.recommended, ...tsStrict],
-    name: 'unicorn-audit/typescript',
+    extends: [js.configs.recommended, tsStrict, unicorn.configs.recommended],
+    name: 'lint-as-if-perfect/typescript',
     files: patternsFor('typescript'),
     languageOptions: {
-      ...unicorn.configs.recommended.languageOptions,
       // Without project configuration, accept both standard browser and Node globals.
       globals: {...globals.builtin, ...globals.browser, ...globals.node},
       ecmaVersion: 'latest',
       sourceType: 'module',
-      parser: tsParser,
       parserOptions: {
         project: false,
         projectService: false,
@@ -84,19 +78,17 @@ export default defineConfig([
 
   // Vue scripts use the Vue parser with TypeScript-capable script parsing.
   selected.has('vue') && {
-    ...unicorn.configs.recommended,
-    extends: [js.configs.recommended, ...tsStrict],
-    name: 'unicorn-audit/vue',
+    extends: [js.configs.recommended, tsStrict, unicorn.configs.recommended],
+    name: 'lint-as-if-perfect/vue',
     files: patternsFor('vue'),
     languageOptions: {
-      ...unicorn.configs.recommended.languageOptions,
       // Without project configuration, accept both standard browser and Node globals.
       globals: {...globals.builtin, ...globals.browser, ...globals.node},
       ecmaVersion: 'latest',
       sourceType: 'module',
       parser: vueParser,
       parserOptions: {
-        parser: tsParser,
+        parser: tseslint.parser,
         project: false,
         projectService: false,
         jsDocParsingMode: 'none',
@@ -109,7 +101,7 @@ export default defineConfig([
 
   // CommonJS suffixes override only the module mode of their language config.
   (selected.has('javascript') || selected.has('typescript')) && {
-    name: 'unicorn-audit/commonjs',
+    name: 'lint-as-if-perfect/commonjs',
     files: ['**/*.cjs', '**/*.cjsx', '**/*.cts', '**/*.ctsx'],
     languageOptions: {
       sourceType: 'commonjs',
@@ -118,23 +110,18 @@ export default defineConfig([
 
   // CSS.
   selected.has('css') && {
-    ...unicorn.configs['recommended-css'],
-    name: 'unicorn-audit/css',
+    extends: [css.configs.recommended, unicorn.configs['recommended-css']],
+    name: 'lint-as-if-perfect/css',
     files: patternsFor('css'),
-    plugins: {
-      unicorn,
-      css,
-    },
     language: 'css/css',
   },
 
   // HTML.
   selected.has('html') && {
-    ...unicorn.configs['recommended-html'],
-    name: 'unicorn-audit/html',
+    extends: [unicorn.configs['recommended-html']],
+    name: 'lint-as-if-perfect/html',
     files: patternsFor('html'),
     plugins: {
-      unicorn,
       html,
     },
     language: 'html/html',
@@ -142,78 +129,54 @@ export default defineConfig([
 
   // JSON dialects are separate configurations, with no cascading dialect overrides.
   selected.has('json') && {
-    ...unicorn.configs['recommended-json'],
-    name: 'unicorn-audit/json',
+    extends: [json.configs.recommended, unicorn.configs['recommended-json']],
+    name: 'lint-as-if-perfect/json',
     files: ['**/*.json'],
-    plugins: {
-      unicorn,
-      json,
-    },
     language: 'json/json',
   },
   selected.has('json') && {
-    ...unicorn.configs['recommended-json'],
-    name: 'unicorn-audit/jsonc',
+    extends: [json.configs.recommended, unicorn.configs['recommended-json']],
+    name: 'lint-as-if-perfect/jsonc',
     files: ['**/*.jsonc'],
-    plugins: {
-      unicorn,
-      json,
-    },
     language: 'json/jsonc',
     languageOptions: {
       allowTrailingCommas: true,
     },
   },
   selected.has('json') && {
-    ...unicorn.configs['recommended-json'],
-    name: 'unicorn-audit/json5',
+    extends: [json.configs.recommended, unicorn.configs['recommended-json']],
+    name: 'lint-as-if-perfect/json5',
     files: ['**/*.json5'],
-    plugins: {
-      unicorn,
-      json,
-    },
     language: 'json/json5',
   },
 
   // Markdown documents, using GitHub Flavored Markdown.
   selected.has('markdown') && {
-    ...unicorn.configs['recommended-markdown'],
-    name: 'unicorn-audit/markdown',
+    extends: [markdown.configs.recommended, unicorn.configs['recommended-markdown']],
+    name: 'lint-as-if-perfect/markdown',
     files: patternsFor('markdown'),
-    plugins: {
-      unicorn,
-      markdown,
-    },
     language: 'markdown/gfm',
   },
 
   // TOML.
   selected.has('toml') && {
-    ...unicorn.configs['recommended-toml'],
-    name: 'unicorn-audit/toml',
+    extends: [toml.configs.recommended, unicorn.configs['recommended-toml']],
+    name: 'lint-as-if-perfect/toml',
     files: patternsFor('toml'),
-    plugins: {
-      unicorn,
-      toml,
-    },
     language: 'toml/toml',
   },
 
   // YAML uses the language plugin's yml namespace.
   selected.has('yaml') && {
-    ...unicorn.configs['recommended-yaml'],
-    name: 'unicorn-audit/yaml',
+    extends: [yml.configs.recommended, unicorn.configs['recommended-yaml']],
+    name: 'lint-as-if-perfect/yaml',
     files: patternsFor('yaml'),
-    plugins: {
-      unicorn,
-      yml,
-    },
     language: 'yml/yaml',
   },
 
   // Function-scoping overrides apply only to script languages.
-  (selected.has('javascript') || selected.has('typescript') || selected.has('vue')) && {
-    name: 'unicorn-audit/script-rule-exceptions',
+  hasScripts && {
+    name: 'lint-as-if-perfect/script-rule-exceptions',
     files: [...patternsFor('javascript'), ...patternsFor('typescript'), ...patternsFor('vue')],
     rules: {
       // Preserve local arrow callbacks and fresh callback identities while still checking ordinary functions.
@@ -228,7 +191,7 @@ export default defineConfig([
 
   // Shared exceptions apply after every language preset.
   {
-    name: 'unicorn-audit/rule-exceptions',
+    name: 'lint-as-if-perfect/rule-exceptions',
     rules: {
       // Filename casing is project-specific; accept conventional names such as README.md and SKILL.md.
       'unicorn/filename-case': 'off',

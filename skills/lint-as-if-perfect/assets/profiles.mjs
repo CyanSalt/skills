@@ -5,9 +5,9 @@ export const profiles = {
   typescript: ['ts', 'cts', 'mts', 'tsx', 'ctsx', 'mtsx'],
   vue: ['vue'],
   css: ['css'],
-  html: ['html', 'htm'],
+  html: ['html'],
   json: ['json', 'jsonc', 'json5'],
-  markdown: ['md', 'markdown'],
+  markdown: ['md'],
   toml: ['toml'],
   yaml: ['yaml', 'yml'],
 };

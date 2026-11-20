@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import {spawnSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
-import {readFile, writeFile, mkdir, stat, realpath, mkdtemp, rm} from 'node:fs/promises';
+import {readFile, writeFile, mkdir, stat, realpath, mkdtempDisposable} from 'node:fs/promises';
 import {globSync} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -46,7 +46,7 @@ function git(cwd, arguments_) {
 }
 function hash(value) {return createHash('sha256').update(value).digest('hex').slice(0, 24);}
 async function exists(file) {
-  try {await stat(file); return true;} catch (error) {if (error.code === 'ENOENT') return false; throw error;}
+  return await stat(file, {throwIfNoEntry: false}) !== undefined;
 }
 function cacheRoot() {
   if (process.env.UNICORN_LINT_CACHE) return path.resolve(process.env.UNICORN_LINT_CACHE);
@@ -209,117 +209,116 @@ async function main() {
   const {diffLines} = await importDependency('diff');
   const checkOptions = {...options, fix: false, 'dry-run': false};
   let reports = await lintBatch(files, cwd, runtime, selected, checkOptions, runtimeConfigHash, 'working');
-  const temporary = base || saved ? await mkdtemp(path.join(runtime, 'baseline-')) : undefined;
+  await using temporary = base || saved ? await mkdtempDisposable(path.join(runtime, 'baseline-')) : undefined;
+  const baselineRoot = temporary?.path;
   const oldSources = new Map();
   const oldPaths = new Map();
   const missing = new Set();
-  try {
-    if (temporary) {
-      for (const file of files) {
-        let source;
-        let relative;
-        if (base) {
-          relative = path.relative(base.root, file).split(path.sep).join('/');
-          if (relative.startsWith('../') || path.isAbsolute(relative)) throw new Error(`File is outside Git repository: ${file}`);
-          const old = base.renames.get(relative) ?? relative;
-          if (!base.tree.has(old)) {missing.add(file); continue;}
-          source = git(base.root, ['show', `${base.commit}:${old}`]);
-        } else {
-          relative = path.relative(cwd, file);
-          if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error(`File is outside snapshot root: ${file}`);
-          const entry = saved.entries[file];
-          if (!entry) continue;
-          if (typeof entry !== 'string' || path.basename(entry) !== entry) throw new Error('Invalid snapshot entry.');
-          source = await readFile(path.join(snapshotRoot, entry), 'utf8');
-        }
-        const oldPath = path.join(temporary, relative);
-        await mkdir(path.dirname(oldPath), {recursive: true});
-        await writeFile(oldPath, source);
-        oldSources.set(file, source);
-        oldPaths.set(file, oldPath);
-      }
-    }
-    const oldReports = temporary ? await lintBatch(oldPaths.values().toArray(), temporary, runtime, selected,
-      {...checkOptions, 'no-cache': true}, runtimeConfigHash, 'baseline') : [];
-    const oldByPath = new Map(oldReports.map(report => [path.resolve(report.filePath), report]));
-    const fixRequested = options.fix;
-    const originalSources = new Map(sources);
-    const isFatalBeforeFix = [...reports, ...oldReports].some(report => report.fatalErrorCount > 0);
-    const fixedFiles = [];
+  if (baselineRoot) {
     for (const file of files) {
-      if (await readFile(file, 'utf8') !== sources.get(file)) throw new Error(`Source changed during lint; rerun: ${file}`);
-    }
-    if (fixRequested && !isFatalBeforeFix) {
-      reports = await lintBatch(files, cwd, runtime, selected, {...options, 'no-cache': true}, runtimeConfigHash, 'working');
-      for (const report of reports) {
-        const file = path.resolve(report.filePath);
-        const content = options['dry-run'] ? report.output ?? sources.get(file) : await readFile(file, 'utf8');
-        if (content !== sources.get(file)) fixedFiles.push(file);
-        sources.set(file, content);
+      let source;
+      let relative;
+      if (base) {
+        relative = path.relative(base.root, file).split(path.sep).join('/');
+        if (relative.startsWith('../') || path.isAbsolute(relative)) throw new Error(`File is outside Git repository: ${file}`);
+        const old = base.renames.get(relative) ?? relative;
+        if (!base.tree.has(old)) {missing.add(file); continue;}
+        source = git(base.root, ['show', `${base.commit}:${old}`]);
+      } else {
+        relative = path.relative(cwd, file);
+        if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error(`File is outside snapshot root: ${file}`);
+        const entry = saved.entries[file];
+        if (!entry) continue;
+        if (typeof entry !== 'string' || path.basename(entry) !== entry) throw new Error('Invalid snapshot entry.');
+        source = await readFile(path.join(snapshotRoot, entry), 'utf8');
       }
+      const oldPath = path.join(baselineRoot, relative);
+      await mkdir(path.dirname(oldPath), {recursive: true});
+      await writeFile(oldPath, source);
+      oldSources.set(file, source);
+      oldPaths.set(file, oldPath);
     }
-    const byFile = new Map(reports.map(report => [path.resolve(report.filePath), report]));
-    const outputFiles = files.map(file => {
-      const report = byFile.get(file);
-      if (!report) throw new Error(`ESLint did not report the requested file: ${file}`);
-      const oldReport = missing.has(file) ? {messages: []} : oldByPath.get(oldPaths.get(file));
-      const messages = classify(report, oldReport, sources.get(file), oldSources.get(file),
-        oldSources.has(file) ? diffLines(oldSources.get(file), sources.get(file)) : []).map(message => ({
-          ...message,
-          ...(message.ruleId?.startsWith('unicorn/') && {documentationPath: ruleDocumentation(message.ruleId, documentation)}),
-        }));
-      return {filePath: file, sourceHash: hash(sources.get(file)), messages,
-        ...(options['dry-run'] && report.output !== undefined && {output: report.output}),
-        baselineErrors: oldReport?.messages.filter(message => message.fatal) ?? [],
-        suppressedMessages: report.suppressedMessages ?? []};
-    });
-    for (const file of files) {
-      const expected = options['dry-run'] ? originalSources.get(file) : sources.get(file);
-      if (await readFile(file, 'utf8') !== expected) throw new Error(`Source changed during lint; rerun: ${file}`);
+  }
+  const oldReports = baselineRoot ? await lintBatch(oldPaths.values().toArray(), baselineRoot, runtime, selected,
+    {...checkOptions, 'no-cache': true}, runtimeConfigHash, 'baseline') : [];
+  const oldByPath = new Map(oldReports.map(report => [path.resolve(report.filePath), report]));
+  const fixRequested = options.fix;
+  const originalSources = new Map(sources);
+  const isFatalBeforeFix = [...reports, ...oldReports].some(report => report.fatalErrorCount > 0);
+  const fixedFiles = [];
+  for (const file of files) {
+    if (await readFile(file, 'utf8') !== sources.get(file)) throw new Error(`Source changed during lint; rerun: ${file}`);
+  }
+  if (fixRequested && !isFatalBeforeFix) {
+    reports = await lintBatch(files, cwd, runtime, selected, {...options, 'no-cache': true}, runtimeConfigHash, 'working');
+    for (const report of reports) {
+      const file = path.resolve(report.filePath);
+      const content = options['dry-run'] ? report.output ?? sources.get(file) : await readFile(file, 'utf8');
+      if (content !== sources.get(file)) fixedFiles.push(file);
+      sources.set(file, content);
     }
-    const summary = {new: 0, existing: 0, unknown: 0, total: 0};
-    for (const file of outputFiles) for (const message of file.messages) {summary[message.status]++; summary.total++;}
-    const repair = {
-      mode: options.fix ? (options['dry-run'] ? 'preview' : 'applied') : 'check',
-      blocked: Boolean(fixRequested && isFatalBeforeFix),
-      fixedFiles,
-      autoFixable: outputFiles.reduce((count, file) => count + file.messages.filter(message => message.fix).length, 0),
-      suggestionCount: outputFiles.reduce((count, file) => count + file.messages.reduce((total, message) => total + (message.suggestions?.length ?? 0), 0), 0),
-      documentationPath: documentation.readme,
-      rulesDocumentationPath: documentation.rules,
-      nextStep: `The agent must independently decide whether each in-scope finding is worth fixing based on benefit, behavior/API compatibility, and change risk; retain intentional or low-value patterns with a concrete reason. Review --fix --dry-run first; apply --fix only when every proposed change is worthwhile and authorized. Read documentationPath or documentationUrl when needed and review messages[].suggestions before manual edits and recheck. Unicorn documentation: ${documentation.readme}. Suggestions are alternatives, not automatic fixes. Preview ranges refer to output, not the original file.`,
-    };
-    const output = {version: 1, configHash: runtimeConfigHash, versions, baseline: base?.commit ?? (saved ? snapshotRoot : null), profiles: selected, summary, repair, files: outputFiles};
-    if (options.format === 'json') process.stdout.write(`${JSON.stringify(output, undefined, 2)}\n`);
-    else {
-      for (const file of outputFiles) {
-        for (const message of file.messages) {
-          process.stdout.write(
-            `${path.relative(cwd, file.filePath)}:${message.line ?? 1}:${message.column ?? 1} [${message.status}] ${message.ruleId ?? 'eslint'} ${message.message}\n`);
-          if (message.documentationPath) process.stdout.write(`  Rule documentation: ${message.documentationPath}\n`);
-          else if (message.documentationUrl) process.stdout.write(`  Rule documentation: ${message.documentationUrl}\n`);
-          if (message.fix) process.stdout.write('  Automatic fix available: use --fix or --fix --dry-run.\n');
-          const suggestions = message.suggestions ?? [];
-          for (const [index, suggestion] of suggestions.entries()) process.stdout.write(
-            `  Suggestion ${index + 1} (review before applying): ${suggestion.desc}\n  Edit: ${JSON.stringify(suggestion.fix)}\n`);
-        }
-        for (const message of file.baselineErrors) process.stdout.write(
-          `${path.relative(cwd, file.filePath)}:${message.line ?? 1}:${message.column ?? 1} [baseline-error] ${message.message}\n`);
+  }
+  const byFile = new Map(reports.map(report => [path.resolve(report.filePath), report]));
+  const outputFiles = files.map(file => {
+    const report = byFile.get(file);
+    if (!report) throw new Error(`ESLint did not report the requested file: ${file}`);
+    const oldReport = missing.has(file) ? {messages: []} : oldByPath.get(oldPaths.get(file));
+    const messages = classify(report, oldReport, sources.get(file), oldSources.get(file),
+      oldSources.has(file) ? diffLines(oldSources.get(file), sources.get(file)) : []).map(message => ({
+        ...message,
+        ...(message.ruleId?.startsWith('unicorn/') && {documentationPath: ruleDocumentation(message.ruleId, documentation)}),
+      }));
+    return {filePath: file, sourceHash: hash(sources.get(file)), messages,
+      ...(options['dry-run'] && report.output !== undefined && {output: report.output}),
+      baselineErrors: oldReport?.messages.filter(message => message.fatal) ?? [],
+      suppressedMessages: report.suppressedMessages ?? []};
+  });
+  for (const file of files) {
+    const expected = options['dry-run'] ? originalSources.get(file) : sources.get(file);
+    if (await readFile(file, 'utf8') !== expected) throw new Error(`Source changed during lint; rerun: ${file}`);
+  }
+  const summary = {new: 0, existing: 0, unknown: 0, total: 0};
+  for (const file of outputFiles) for (const message of file.messages) {summary[message.status]++; summary.total++;}
+  const repair = {
+    mode: options.fix ? (options['dry-run'] ? 'preview' : 'applied') : 'check',
+    blocked: Boolean(fixRequested && isFatalBeforeFix),
+    fixedFiles,
+    autoFixable: outputFiles.reduce((count, file) => count + file.messages.filter(message => message.fix).length, 0),
+    suggestionCount: outputFiles.reduce((count, file) => count + file.messages.reduce((total, message) => total + (message.suggestions?.length ?? 0), 0), 0),
+    documentationPath: documentation.readme,
+    rulesDocumentationPath: documentation.rules,
+    nextStep: `The agent must independently decide whether each in-scope finding is worth fixing based on benefit, behavior/API compatibility, and change risk; retain intentional or low-value patterns with a concrete reason. Review --fix --dry-run first; apply --fix only when every proposed change is worthwhile and authorized. Read documentationPath or documentationUrl when needed and review messages[].suggestions before manual edits and recheck. Unicorn documentation: ${documentation.readme}. Suggestions are alternatives, not automatic fixes. Preview ranges refer to output, not the original file.`,
+  };
+  const output = {version: 1, configHash: runtimeConfigHash, versions, baseline: base?.commit ?? (saved ? snapshotRoot : null), profiles: selected, summary, repair, files: outputFiles};
+  if (options.format === 'json') process.stdout.write(`${JSON.stringify(output, undefined, 2)}\n`);
+  else {
+    for (const file of outputFiles) {
+      for (const message of file.messages) {
+        process.stdout.write(
+          `${path.relative(cwd, file.filePath)}:${message.line ?? 1}:${message.column ?? 1} [${message.status}] ${message.ruleId ?? 'eslint'} ${message.message}\n`);
+        if (message.documentationPath) process.stdout.write(`  Rule documentation: ${message.documentationPath}\n`);
+        else if (message.documentationUrl) process.stdout.write(`  Rule documentation: ${message.documentationUrl}\n`);
+        if (message.fix) process.stdout.write('  Automatic fix available: use --fix or --fix --dry-run.\n');
+        const suggestions = message.suggestions ?? [];
+        for (const [index, suggestion] of suggestions.entries()) process.stdout.write(
+          `  Suggestion ${index + 1} (review before applying): ${suggestion.desc}\n  Edit: ${JSON.stringify(suggestion.fix)}\n`);
       }
-      process.stdout.write(`Total ${summary.total}: new ${summary.new}, existing ${summary.existing}, unknown ${summary.unknown}.\n`);
-      if (fixRequested) process.stdout.write(`${repair.blocked ? 'Fix blocked by parsing errors' : repair.mode}: ${fixedFiles.length} changed file(s).\n`);
-      process.stdout.write(`Plugin documentation: ${documentation.readme}\n`);
-      if (summary.total) process.stdout.write(`${repair.autoFixable} automatic fix(es), ${repair.suggestionCount} suggestion(s). ${repair.nextStep}\n`);
+      for (const message of file.baselineErrors) process.stdout.write(
+        `${path.relative(cwd, file.filePath)}:${message.line ?? 1}:${message.column ?? 1} [baseline-error] ${message.message}\n`);
     }
-    const isFatal = [...reports, ...oldReports].some(report => report.fatalErrorCount > 0);
-    const findings = base || saved ? summary.new + summary.unknown : summary.total;
-    process.exitCode = isFatal ? 2 : (findings ? 1 : 0);
-  } finally {if (temporary) await rm(temporary, {recursive: true, force: true});}
+    process.stdout.write(`Total ${summary.total}: new ${summary.new}, existing ${summary.existing}, unknown ${summary.unknown}.\n`);
+    if (fixRequested) process.stdout.write(`${repair.blocked ? 'Fix blocked by parsing errors' : repair.mode}: ${fixedFiles.length} changed file(s).\n`);
+    process.stdout.write(`Plugin documentation: ${documentation.readme}\n`);
+    if (summary.total) process.stdout.write(`${repair.autoFixable} automatic fix(es), ${repair.suggestionCount} suggestion(s). ${repair.nextStep}\n`);
+  }
+  const isFatal = [...reports, ...oldReports].some(report => report.fatalErrorCount > 0);
+  const findings = base || saved ? summary.new + summary.unknown : summary.total;
+  process.exitCode = isFatal ? 2 : (findings ? 1 : 0);
 }
 
 try {
   await main();
 } catch (error) {
-  process.stderr.write(`lint-with-unicorn: ${error.message}\n`);
+  process.stderr.write(`lint-as-if-perfect: ${error.message}\n`);
   process.exitCode = 2;
 }

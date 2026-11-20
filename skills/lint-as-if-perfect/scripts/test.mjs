@@ -1,17 +1,18 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
 import {spawnSync} from 'node:child_process';
-import {mkdtemp, writeFile, readFile, mkdir, rm, rename, readdir, realpath, chmod, symlink} from 'node:fs/promises';
+import {mkdtempDisposable, writeFile, readFile, mkdir, rm, rename, readdir, realpath, chmod, symlink} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {test} from 'node:test';
 import {classify, lineMapping} from './compare.mjs';
+import {documentationReady, prepareDocumentation} from './documentation.mjs';
 import {documentationSource, highestStableVersion, resolveDependencies, prepareRuntime} from './runtime.mjs';
 
 const script = fileURLToPath(new URL('lint.mjs', import.meta.url));
-const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), 'unicorn-tests-'));
-const root = await realpath(temporaryRoot);
+await using temporaryRoot = await mkdtempDisposable(path.join(os.tmpdir(), 'lint-as-if-perfect-tests-'));
+const root = await realpath(temporaryRoot.path);
 const fixture = path.join(root, 'project');
 await mkdir(fixture);
 function execute(arguments_, environment = process.env) {
@@ -46,17 +47,16 @@ const files = {
   'plain.vue': `<script>\n${code}</script>\n<template><div /></template>\n`,
   'sample.css': 'a { transition: all 1s; background: url("http://example.com/a.png"); }\n',
   'sample.html': '<!doctype html><a href="http://example.com">Example</a>\n',
-  'sample.htm': '<!doctype html><a href="http://example.com">Example</a>\n',
   'sample.json': '{"url":"http://example.com"}\n',
   'sample.jsonc': '// Comment\n{"url":"http://example.com",}\n',
   'sample.json5': '{url: "http://example.com",}\n',
-  'sample.md': '[Example](http://example.com)\n', 'sample.markdown': '[Example](http://example.com)\n',
+  'sample.md': '[Example](http://example.com)\n',
   'sample.toml': 'url = "http://example.com"\n',
   'sample.yaml': 'url: http://example.com\n', 'sample.yml': 'url: http://example.com\n',
 };
 for (const [name, source] of Object.entries(files)) await writeFile(path.join(fixture, name), source);
 
-try {
+{
   await test('npm resolves wildcard and semver ranges and documentation follows the selected release', async () => {
     assert.equal(highestStableVersion(['2.9.0', '10.1.0', '11.0.0-beta.1', '2.10.0']), '10.1.0');
     assert.equal(highestStableVersion('6.0.3'), '6.0.3');
@@ -113,6 +113,8 @@ if (args[0] === '--version') {
     assert.ok(install.args.includes('--ignore-workspace'));
     assert.ok(install.args.includes('--prefer-offline'));
     assert.ok(!preferredCalls.some(call => call.manager === 'npm' && call.args.includes('install')));
+    const failedRuntime = path.join(environment.UNICORN_LINT_CACHE, 'runtimes');
+    for (const name of await readdir(failedRuntime)) assert.ok(!(await readdir(path.join(failedRuntime, name))).includes('.install-lock'));
     await writeFile(log, '');
     const failedProbe = execute(['--', 'sample.js'], {...environment, FAIL_PNPM_PROBE: '1'});
     assert.equal(failedProbe.status, 2);
@@ -128,6 +130,42 @@ if (args[0] === '--version') {
     const offline = execute(['--no-install', '--', 'sample.js'], environment);
     assert.equal(offline.status, 2);
     assert.deepEqual(await calls(), []);
+  });
+  await test('documentation staging is disposed on publication and failure, and oversized streams are cancelled', async context => {
+    await using temporary = await mkdtempDisposable(path.join(root, 'documentation-test-'));
+    const runtime = temporary.path;
+    const packageDirectory = path.join(runtime, 'node_modules', 'eslint-plugin-unicorn');
+    await mkdir(packageDirectory, {recursive: true});
+    await writeFile(path.join(packageDirectory, 'package.json'), JSON.stringify({version: '1.0.0'}));
+    await writeFile(path.join(runtime, 'runtime-loader.mjs'), `import {mkdir, writeFile} from 'node:fs/promises';
+import path from 'node:path';
+export default function importDependency() {
+  return {async x({cwd}) {
+    await mkdir(path.join(cwd, 'docs', 'rules'), {recursive: true});
+    await writeFile(path.join(cwd, 'package.json'), JSON.stringify({name: 'eslint-plugin-unicorn', version: '1.0.0'}));
+    await writeFile(path.join(cwd, 'readme.md'), '# Fixture documentation\\n');
+    await writeFile(path.join(cwd, 'docs', 'rules', 'prefer-includes.md'), '# Fixture rule\\n');
+  }};
+}
+`);
+    const source = {package: 'eslint-plugin-unicorn', version: '1.0.0', commit: 'a'.repeat(40), archiveUrl: 'https://documentation.example.invalid/fixture'};
+    const fetchMock = context.mock.method(globalThis, 'fetch', async () => new Response('Fixture archive'));
+    const published = await prepareDocumentation(runtime, source);
+    assert.equal(await documentationReady(runtime, source), true);
+    assert.ok((await readdir(runtime)).every(name => !name.startsWith('documentation-')));
+    await assert.rejects(prepareDocumentation(runtime, {...source, commit: 'b'.repeat(40), version: '2.0.0'}), /Plugin and documentation versions differ/u);
+    await writeFile(path.join(packageDirectory, 'package.json'), JSON.stringify({version: '2.0.0'}));
+    await assert.rejects(prepareDocumentation(runtime, {...source, commit: 'b'.repeat(40), version: '2.0.0'}), /archive does not match/u);
+    assert.ok((await readdir(runtime)).every(name => !name.startsWith('documentation-')));
+    assert.equal(await readFile(published.readme, 'utf8'), '# Fixture documentation\n');
+    let cancelled = false;
+    fetchMock.mock.mockImplementation(async () => new Response(new ReadableStream({
+      start(controller) {controller.enqueue(new Uint8Array(16 * 1024 * 1024 + 1));},
+      cancel() {cancelled = true;},
+    })));
+    await assert.rejects(prepareDocumentation(runtime, {...source, commit: 'b'.repeat(40), version: '2.0.0'}), /exceeds 16 MiB/u);
+    assert.equal(cancelled, true);
+    assert.ok((await readdir(runtime)).every(name => !name.startsWith('documentation-')));
   });
   await test('cold JavaScript installation needs no optional language packages and is reused offline', async () => {
     const coldCache = path.join(root, 'cold-cache');
@@ -282,10 +320,105 @@ assert.equal(typeof module.diffLines, 'function');
         }
       }
       const extension = path.extname(report.filePath);
-      if (['.css', '.html', '.htm', '.json', '.jsonc', '.json5', '.md', '.markdown', '.toml', '.yaml', '.yml'].includes(extension)) {
-        assert.ok(report.messages.every(message => message.ruleId.startsWith('unicorn/')), JSON.stringify(report));
+      if (['.css', '.html', '.json', '.jsonc', '.json5', '.md', '.toml', '.yaml', '.yml'].includes(extension)) {
+        const namespace = {'.css': 'css/', '.json': 'json/', '.jsonc': 'json/', '.json5': 'json/',
+          '.md': 'markdown/', '.toml': 'toml/', '.yaml': 'yml/', '.yml': 'yml/'}[extension];
+        assert.ok(report.messages.every(message => message.ruleId.startsWith('unicorn/') || namespace && message.ruleId.startsWith(namespace)), JSON.stringify(report));
         assert.ok(report.messages.some(message => message.ruleId === 'unicorn/prefer-https'), JSON.stringify(report));
       }
+    }
+  });
+  await test('non-script recommended presets cover every rule and preserve profiles and dialects', async () => {
+    const cases = [
+      {name: 'recommended.css', source: 'a { unknown-property: 1; }\n', rule: 'css/no-invalid-properties', namespace: 'css/'},
+      {name: 'recommended.json', source: '{"value":1,"value":2}\n', rule: 'json/no-duplicate-keys', namespace: 'json/'},
+      {name: 'recommended.jsonc', source: '// Comment\n{"value":1,"value":2,}\n', rule: 'json/no-duplicate-keys', namespace: 'json/'},
+      {name: 'recommended.json5', source: '{value:1,value:2,}\n', rule: 'json/no-duplicate-keys', namespace: 'json/'},
+      {name: 'recommended.md', source: '# Document\n\n| Link |\n| --- |\n| []() |\n\n[Link][missing]\n\n```ts\nexport const = ;\n```\n', rule: 'markdown/no-empty-links', namespace: 'markdown/'},
+      {name: 'recommended.toml', source: 'value = 9223372036854775808\n', rule: 'toml/precision-of-integer', namespace: 'toml/'},
+      {name: 'recommended.yaml', source: 'value:\n', rule: 'yml/no-empty-mapping-value', namespace: 'yml/'},
+      {name: 'recommended.yml', source: 'value:\n', rule: 'yml/no-empty-mapping-value', namespace: 'yml/'},
+    ];
+    const probe = path.join(root, 'recommended-probe.mjs');
+    try {
+      for (const {name, source} of cases) await writeFile(path.join(fixture, name), source);
+      const output = resultOf(['--no-install', '--', ...cases.map(item => item.name)], 1);
+      for (const {name, rule, namespace, source} of cases) {
+        const report = output.files.find(file => path.basename(file.filePath) === name);
+        assert.ok(report.messages.some(message => message.ruleId === rule), JSON.stringify(report));
+        assert.ok(report.messages.every(message => !message.fatal && (message.ruleId.startsWith(namespace) || message.ruleId.startsWith('unicorn/'))), JSON.stringify(report));
+        for (const message of report.messages) assert.equal(typeof message.documentationUrl, 'string');
+        if (name.endsWith('.md')) assert.ok(report.messages.some(message => message.ruleId === 'markdown/no-missing-label-refs'), name);
+        assert.equal(await readFile(path.join(fixture, name), 'utf8'), source);
+        // A single-language invocation must behave like the same file in a mixed batch.
+        const separate = resultOf(['--no-install', '--', name], 1);
+        assert.deepEqual(separate.files[0].messages, report.messages, name);
+      }
+      const runtime = path.dirname(path.dirname(output.repair.documentationPath));
+      await writeFile(probe, `import assert from 'node:assert/strict';
+import path from 'node:path';
+import {pathToFileURL} from 'node:url';
+const [runtime, skill, cwd] = process.argv.slice(2);
+const {default: load} = await import(pathToFileURL(path.join(runtime, 'runtime-loader.mjs')));
+const {ESLint} = await load('eslint');
+const {defineConfig} = await load('eslint/config');
+const eslint = new ESLint({cwd, overrideConfigFile: path.join(skill, 'assets', 'eslint.config.mjs')});
+const checks = [
+  ['@eslint/css', ['recommended.css'], 'css'],
+  ['@eslint/json', ['recommended.json', 'recommended.jsonc', 'recommended.json5'], undefined],
+  ['@eslint/markdown', ['recommended.md'], 'gfm'],
+  ['eslint-plugin-toml', ['recommended.toml'], 'toml'],
+  ['eslint-plugin-yml', ['recommended.yaml', 'recommended.yml'], 'yaml'],
+];
+for (const [name, files, language] of checks) {
+  const {default: plugin} = await load(name);
+  const rules = Object.assign({}, ...[plugin.configs.recommended].flat().map(block => block.rules));
+  for (const file of files) {
+    const config = await eslint.calculateConfigForFile(path.join(cwd, file));
+    const key = language ?? path.extname(file).slice(1);
+    const namespace = {css: 'css', json: 'json', jsonc: 'json', json5: 'json', gfm: 'markdown', toml: 'toml', yaml: 'yml'}[key];
+    const official = new ESLint({cwd, overrideConfigFile: true, overrideConfig: defineConfig({
+      files: [file], extends: [plugin.configs.recommended],
+      plugins: {[namespace]: plugin}, language: namespace + '/' + key,
+    })});
+    const expected = await official.calculateConfigForFile(path.join(cwd, file));
+    for (const rule of Object.keys(rules)) {
+      // ESLint normalizes severity and merges rule default options into the effective settings.
+      assert.deepEqual(config.rules[rule], expected.rules[rule], file + ': ' + rule);
+    }
+    assert.equal(config.language, plugin.languages[key], file);
+    assert.equal(config.processor, undefined, file);
+  }
+}
+const ts = await load('typescript-eslint');
+const compatibilityRules = Object.assign({}, ...ts.configs.strict.map(block => block.files ? block.rules : {}));
+const reference = new ESLint({cwd, overrideConfigFile: true, overrideConfig: defineConfig({files: ['**/*.ts'], extends: [ts.configs.strict]})});
+const expectedTs = await reference.calculateConfigForFile(path.join(cwd, 'sample.ts'));
+for (const file of ['sample.ts', 'sample.cts', 'sample.mts', 'sample.tsx', 'sample.ctsx', 'sample.mtsx', 'sample.vue']) {
+  const config = await eslint.calculateConfigForFile(path.join(cwd, file));
+  for (const rule of Object.keys(compatibilityRules)) assert.deepEqual(config.rules[rule], expectedTs.rules[rule], file + ': ' + rule);
+}
+const namespaces = ['css/', 'json/', 'markdown/', 'toml/', 'yml/'];
+for (const file of ['sample.js', 'sample.ts', 'sample.vue', 'sample.html']) {
+  const config = await eslint.calculateConfigForFile(path.join(cwd, file));
+  assert.ok(Object.keys(config.rules).every(rule => namespaces.every(namespace => !rule.startsWith(namespace))), file);
+}
+`);
+      const configuration = spawnSync(process.execPath, [probe, runtime, fileURLToPath(new URL('..', import.meta.url)), fixture], {
+        encoding: 'utf8', shell: false, timeout: 30_000, env: {...process.env, UNICORN_LINT_RUNTIME: runtime,
+          UNICORN_LINT_PROFILES: JSON.stringify(['javascript', 'typescript', 'vue', 'html', ...output.profiles])},
+      });
+      assert.equal(configuration.status, 0, configuration.stderr);
+      const text = execute(['--no-install', '--format', 'text', '--', 'recommended.yaml']);
+      assert.equal(text.status, 1);
+      assert.match(text.stdout, /Rule documentation: https:/u);
+      const snapshot = path.join(root, 'recommended-before');
+      resultOf(['--snapshot', snapshot, '--', 'recommended.yaml'], 0);
+      const compared = resultOf(['--no-install', '--baseline', snapshot, '--', 'recommended.yaml'], 0);
+      assert.ok(compared.files[0].messages.some(message => message.ruleId === 'yml/no-empty-mapping-value' && message.status === 'existing'));
+    } finally {
+      for (const {name} of cases) await rm(path.join(fixture, name), {force: true});
+      await rm(probe, {force: true});
     }
   });
   await test('script presets report core and strict findings without type services or non-script leakage', async () => {
@@ -362,12 +495,10 @@ assert.equal(typeof module.diffLines, 'function');
       '.vue': `<script setup>\n${functionSource}</script>\n<template><div /></template>\n`,
       '.css': `${names.map(name => `.${name}`).join(', ')} { color: red; }\n`,
       '.html': `<!doctype html><div class="${names.join(' ')}"></div>\n`,
-      '.htm': `<!doctype html><div class="${names.join(' ')}"></div>\n`,
       '.json': '{"value":1}\n',
       '.jsonc': '{"value":1}\n',
       '.json5': '{value:1}\n',
       '.md': '# Naming\n',
-      '.markdown': '# Naming\n',
       '.toml': 'value = 1\n',
       '.yaml': 'value: 1\n',
       '.yml': 'value: 1\n',
@@ -492,13 +623,11 @@ assert.equal(typeof module.diffLines, 'function');
     assert.equal(unicode.files.length, 1);
     await rm(path.join(fixture, '\u{4E2D}\u{6587} name.js'));
   });
-  await test('offline missing dependencies and unsupported or unmatched inputs fail explicitly', async () => {
+  await test('offline missing dependencies and unmatched inputs fail explicitly', async () => {
     const offline = execute(['--no-install', '--', 'sample.js'],
       {...process.env, UNICORN_LINT_CACHE: path.join(root, 'empty-cache')});
     assert.equal(offline.status, 2);
     assert.match(offline.stderr, /dependencies are missing/u);
-    await writeFile(path.join(fixture, 'unsupported.soml'), 'value = 1\n');
-    assert.equal(execute(['--', 'unsupported.soml']).status, 2);
     assert.equal(execute(['--', 'missing*.ts']).status, 2);
     await mkdir(path.join(fixture, 'node_modules'));
     await writeFile(path.join(fixture, 'node_modules', 'ignored.js'), code);
@@ -519,6 +648,21 @@ assert.equal(typeof module.diffLines, 'function');
     const output = resultOf(['--no-install', '--', 'invalid.ts'], 2);
     assert.ok(output.files[0].messages.some(message => message.fatal && message.status === 'unknown'));
     await rm(path.join(fixture, 'invalid.ts'));
+  });
+  await test('baseline directories are disposed on successful comparison and setup failure', async () => {
+    const snapshot = path.join(root, 'cleanup-before');
+    resultOf(['--snapshot', snapshot, '--', 'sample.js'], 0);
+    const compared = resultOf(['--baseline', snapshot, '--no-install', '--', 'sample.js'], 0);
+    const runtime = path.dirname(path.dirname(compared.repair.documentationPath));
+    assert.ok((await readdir(runtime)).every(name => !name.startsWith('baseline-')));
+    const file = path.join(snapshot, 'snapshot.json');
+    const metadata = JSON.parse(await readFile(file, 'utf8'));
+    metadata.entries[path.join(fixture, 'sample.js')] = '../invalid.js';
+    await writeFile(file, JSON.stringify(metadata));
+    const failed = execute(['--baseline', snapshot, '--no-install', '--', 'sample.js']);
+    assert.equal(failed.status, 2);
+    assert.match(failed.stderr, /Invalid snapshot entry/u);
+    assert.ok((await readdir(runtime)).every(name => !name.startsWith('baseline-')));
   });
   await test('snapshot comparison distinguishes existing, new, missing, and ambiguous content', async () => {
     const snapshot = path.join(root, 'before');
@@ -675,4 +819,4 @@ assert.equal(typeof module.diffLines, 'function');
     const broken = classify({messages: [message]}, {messages: [{fatal: true}]}, 'bad\n', '', []);
     assert.equal(broken[0].status, 'unknown');
   });
-} finally {await rm(root, {recursive: true, force: true});}
+}

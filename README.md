@@ -24,4 +24,4 @@ pnpm dlx skills add CyanSalt/skills --skill <skill-name>
 |-------|-------------|
 | [design-as-me](skills/design-as-me/SKILL.md) | Designs and refines pages using my personal design preferences. |
 | [design-as-them](skills/design-as-them/SKILL.md) | Creates a personalized `design-as-me` skill from the user's design preferences. |
-| [lint-with-unicorn](skills/lint-with-unicorn/SKILL.md) | Audits selected files with Unicorn recommended presets and compares findings against Git or pre-edit snapshots. |
+| [lint-as-if-perfect](skills/lint-as-if-perfect/SKILL.md) | Audits selected files with ESLint language recommended, typescript-eslint strict, YAML/TOML recommended, and Unicorn presets, with agent-reviewed repairs and Git or pre-edit comparison. |

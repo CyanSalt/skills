@@ -1,6 +1,7 @@
 import {execFileSync, execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {mkdir, readFile, writeFile, rm, copyFile, mkdtempDisposable, rename} from 'node:fs/promises';
+import {setTimeout} from 'node:timers/promises';
 import path from 'node:path';
 import {documentationReady, prepareDocumentation} from './documentation.mjs';
 
@@ -123,25 +124,25 @@ export async function prepareRuntime(runtime, requirements, documentConfig, noIn
     try {await mkdir(lock); break;} catch (error) {
       if (error.code !== 'EEXIST') throw error;
       if (Date.now() > deadline) throw new Error(`Install lock timed out: ${lock}. Inspect interrupted installations before removing it.`);
-      await new Promise(resolve => setTimeout(resolve, 250));
+      await setTimeout(250);
     }
   }
-  try {
-    resolved = {...(await readJson(resolutionFile)), ...releases};
-    const packages = [];
-    for (const [name, release] of Object.entries(releases)) {
-      const installed = await readJson(path.join(runtime, 'node_modules', name, 'package.json'));
-      if (installed?.version !== release.version) packages.push(`${name}@${release.version}`);
-    }
-    if (packages.length > 0) {
-      const packageFile = path.join(runtime, 'package.json');
-      if (!await readJson(packageFile)) await writeFile(packageFile, JSON.stringify({private: true, type: 'module'}));
-      await installDependencies(runtime, packages);
-    }
-    if (!await ready(resolved)) throw new Error('Installed runtime differs from resolved versions.');
-    await syncLoader();
-    await prepareDocumentation(runtime, documentationSource(documentConfig, resolved[documentConfig.package]));
-    await writeFile(resolutionFile, JSON.stringify(resolved, undefined, 2));
-    return Object.fromEntries(Object.keys(requirements).map(name => [name, resolved[name].version]));
-  } finally {await rm(lock, {recursive: true, force: true});}
+  await using lockCleanup = new AsyncDisposableStack();
+  lockCleanup.defer(() => rm(lock, {recursive: true, force: true}));
+  resolved = {...(await readJson(resolutionFile)), ...releases};
+  const packages = [];
+  for (const [name, release] of Object.entries(releases)) {
+    const installed = await readJson(path.join(runtime, 'node_modules', name, 'package.json'));
+    if (installed?.version !== release.version) packages.push(`${name}@${release.version}`);
+  }
+  if (packages.length > 0) {
+    const packageFile = path.join(runtime, 'package.json');
+    if (!await readJson(packageFile)) await writeFile(packageFile, JSON.stringify({private: true, type: 'module'}));
+    await installDependencies(runtime, packages);
+  }
+  if (!await ready(resolved)) throw new Error('Installed runtime differs from resolved versions.');
+  await syncLoader();
+  await prepareDocumentation(runtime, documentationSource(documentConfig, resolved[documentConfig.package]));
+  await writeFile(resolutionFile, JSON.stringify(resolved, undefined, 2));
+  return Object.fromEntries(Object.keys(requirements).map(name => [name, resolved[name].version]));
 }
