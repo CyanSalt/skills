@@ -1,6 +1,6 @@
 import {execFileSync, execFile} from 'node:child_process';
 import {promisify} from 'node:util';
-import {mkdir, readFile, writeFile, rm} from 'node:fs/promises';
+import {mkdir, readFile, writeFile, rm, copyFile, mkdtempDisposable, rename} from 'node:fs/promises';
 import path from 'node:path';
 import {documentationReady, prepareDocumentation} from './documentation.mjs';
 
@@ -90,6 +90,14 @@ export function documentationSource(config, release) {
 
 export async function prepareRuntime(runtime, requirements, documentConfig, noInstall) {
   const resolutionFile = path.join(runtime, 'resolved-dependencies.json');
+  const loaderSource = new URL('runtime-loader.mjs', import.meta.url);
+  const loaderFile = path.join(runtime, 'runtime-loader.mjs');
+  async function syncLoader() {
+    await using temporary = await mkdtempDisposable(path.join(runtime, '.loader-'));
+    const file = path.join(temporary.path, 'runtime-loader.mjs');
+    await copyFile(loaderSource, file);
+    await rename(file, loaderFile);
+  }
   async function ready(resolved) {
     if (!resolved) return false;
     for (const [name, spec] of Object.entries(requirements)) {
@@ -104,6 +112,7 @@ export async function prepareRuntime(runtime, requirements, documentConfig, noIn
     if (!await ready(resolved)) throw new Error('Runtime dependencies are missing or do not match cached resolutions. Run without --no-install once.');
     const source = documentationSource(documentConfig, resolved[documentConfig.package]);
     if (!await documentationReady(runtime, source)) throw new Error('Plugin documentation is missing or invalid. Run without --no-install once.');
+    await syncLoader();
     return Object.fromEntries(Object.keys(requirements).map(name => [name, resolved[name].version]));
   }
   const releases = await resolveDependencies(requirements);
@@ -130,6 +139,7 @@ export async function prepareRuntime(runtime, requirements, documentConfig, noIn
       await installDependencies(runtime, packages);
     }
     if (!await ready(resolved)) throw new Error('Installed runtime differs from resolved versions.');
+    await syncLoader();
     await prepareDocumentation(runtime, documentationSource(documentConfig, resolved[documentConfig.package]));
     await writeFile(resolutionFile, JSON.stringify(resolved, undefined, 2));
     return Object.fromEntries(Object.keys(requirements).map(name => [name, resolved[name].version]));

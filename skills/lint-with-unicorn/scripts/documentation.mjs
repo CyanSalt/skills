@@ -1,5 +1,4 @@
 import {createHash} from 'node:crypto';
-import {createRequire} from 'node:module';
 import {mkdir, mkdtemp, readFile, writeFile, readdir, rm, rename} from 'node:fs/promises';
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
@@ -62,9 +61,8 @@ export async function prepareDocumentation(runtime, source) {
     const output = path.join(staging, 'content');
     await writeFile(archiveFile, archive);
     await mkdir(output);
-    const require = createRequire(path.join(runtime, 'package.json'));
-    const tarModule = await import(pathToFileURL(require.resolve('tar')).href);
-    const tar = tarModule.default ?? tarModule;
+    const {default: importDependency} = await import(pathToFileURL(path.join(runtime, 'runtime-loader.mjs')).href);
+    const tar = await importDependency('tar');
     const prefix = `eslint-plugin-unicorn-${source.commit}/`;
     await tar.x({
       file: archiveFile,

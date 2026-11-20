@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import {spawnSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
-import {createRequire} from 'node:module';
 import {readFile, writeFile, mkdir, stat, realpath, mkdtemp, rm} from 'node:fs/promises';
 import {globSync} from 'node:fs';
 import os from 'node:os';
@@ -31,7 +30,7 @@ Exit: 0 no new findings (or no findings without baseline), 1 findings/unknowns,
       2 setup, selection, configuration or parsing failure. Source writes require --fix.
 --fix applies all automatic fixes in selected files, including historical findings.
 Suggestions require AI review and are never applied automatically.
-Requires Node >=22.13 (22.x), or >=24, npm for metadata; prefers pnpm on PATH for installation.
+Requires Node >=24.4, npm for metadata; prefers pnpm on PATH for installation.
 Git is required only for --base/--changed.
 Cache root: UNICORN_LINT_CACHE or the OS user cache directory.`;
 
@@ -92,7 +91,7 @@ async function lintBatch(files, cwd, runtime, selected, options, configHash, cac
   const cacheFile = path.join(cacheRoot(), 'results', `${hash(`${cwd}:${configHash}:${cacheLabel}`)}.cache`);
   const arguments_ = [path.join(runtime, 'node_modules', 'eslint', 'bin', 'eslint.js'),
     '--no-config-lookup', '--config', path.join(skill, 'assets', 'eslint.config.mjs'),
-    '--no-inline-config', '--format', 'json', '--exit-on-fatal-error', '--concurrency', options.concurrency ?? 'off',
+    '--no-inline-config', '--format', 'json-with-metadata', '--exit-on-fatal-error', '--concurrency', options.concurrency ?? 'off',
     '--cache-location', cacheFile];
   if (!options['no-cache']) {
     await mkdir(path.dirname(cacheFile), {recursive: true});
@@ -104,13 +103,22 @@ async function lintBatch(files, cwd, runtime, selected, options, configHash, cac
     ...process.env, UNICORN_LINT_RUNTIME: runtime, UNICORN_LINT_PROFILES: JSON.stringify(selected),
   }});
   let reports;
-  try {reports = JSON.parse(result.stdout);} catch {
+  let rulesMeta;
+  try {
+    const output = JSON.parse(result.stdout);
+    reports = output.results;
+    rulesMeta = output.metadata?.rulesMeta;
+  } catch {
     throw new Error(`ESLint failed (${result.status}):\n${result.stderr || result.stdout}`);
   }
   if (!Array.isArray(reports) || result.status > 2 || result.signal) throw new Error(`Unexpected ESLint result: ${result.stderr}`);
   if (result.status === 2 && reports.every(report => !report.fatalErrorCount)) throw new Error(`ESLint configuration failed: ${result.stderr}`);
   const ignored = reports.find(report => report.messages.some(message => !message.ruleId && !message.fatal));
   if (ignored) throw new Error(`ESLint did not audit ${ignored.filePath}: ${ignored.messages.map(message => message.message).join(' ')}`);
+  for (const report of reports) for (const message of report.messages) {
+    const documentationUrl = rulesMeta?.[message.ruleId]?.docs?.url;
+    if (documentationUrl) message.documentationUrl = documentationUrl;
+  }
   return reports;
 }
 
@@ -142,7 +150,7 @@ async function main() {
   }});
   if (options.help) {process.stdout.write(`${help}\n`); return;}
   const [major, minor] = process.versions.node.split('.').map(Number);
-  if (!(major === 22 && minor >= 13 || major >= 24)) throw new Error('Requires Node 22.13+ (22.x) or Node 24+.');
+  if (!(major === 24 && minor >= 4 || major > 24)) throw new Error('Requires Node 24.4+.');
   if (!['json', 'text'].includes(options.format)) throw new Error('--format must be json or text.');
   if (options.concurrency && !/^(?:off|auto|[1-9]\d*)$/u.test(options.concurrency)) throw new Error('Invalid --concurrency.');
   if (options.base && options.baseline || options.snapshot && (options.base || options.baseline)) throw new Error('Use only one of --base, --baseline, or --snapshot.');
@@ -164,7 +172,8 @@ async function main() {
   const selected = [...new Set(files.map(file => profileFor(file)))].toSorted((left, right) => left.localeCompare(right));
   const manifest = JSON.parse(await readFile(path.join(skill, 'assets', 'dependencies.json'), 'utf8'));
   const configHash = hash(JSON.stringify(manifest) + await readFile(path.join(skill, 'assets', 'eslint.config.mjs'), 'utf8')
-    + await readFile(path.join(skill, 'assets', 'profiles.mjs'), 'utf8'));
+    + await readFile(path.join(skill, 'assets', 'profiles.mjs'), 'utf8')
+    + await readFile(path.join(skill, 'scripts', 'runtime-loader.mjs'), 'utf8'));
   const sources = new Map(await Promise.all(files.map(async file => [file, await readFile(file, 'utf8')])));
   if (options.snapshot) {
     const target = path.resolve(cwd, options.snapshot);
@@ -196,8 +205,8 @@ async function main() {
   const versions = await prepareRuntime(runtime, needed, documentConfig, options['no-install']);
   const runtimeConfigHash = hash(configHash + JSON.stringify(versions));
   const documentation = documentationPaths(runtime);
-  const require = createRequire(path.join(runtime, 'package.json'));
-  const {diffLines} = await import(pathToFileURL(require.resolve('diff')).href);
+  const {default: importDependency} = await import(pathToFileURL(path.join(runtime, 'runtime-loader.mjs')).href);
+  const {diffLines} = await importDependency('diff');
   const checkOptions = {...options, fix: false, 'dry-run': false};
   let reports = await lintBatch(files, cwd, runtime, selected, checkOptions, runtimeConfigHash, 'working');
   const temporary = base || saved ? await mkdtemp(path.join(runtime, 'baseline-')) : undefined;
@@ -278,7 +287,7 @@ async function main() {
       suggestionCount: outputFiles.reduce((count, file) => count + file.messages.reduce((total, message) => total + (message.suggestions?.length ?? 0), 0), 0),
       documentationPath: documentation.readme,
       rulesDocumentationPath: documentation.rules,
-      nextStep: `Prefer ESLint --fix within the authorized scope; then read each finding's documentationPath and review messages[].suggestions before manual edits and recheck. Plugin documentation: ${documentation.readme}. Suggestions are alternatives, not automatic fixes. Preview ranges refer to output, not the original file.`,
+      nextStep: `The agent must independently decide whether each in-scope finding is worth fixing based on benefit, behavior/API compatibility, and change risk; retain intentional or low-value patterns with a concrete reason. Review --fix --dry-run first; apply --fix only when every proposed change is worthwhile and authorized. Read documentationPath or documentationUrl when needed and review messages[].suggestions before manual edits and recheck. Unicorn documentation: ${documentation.readme}. Suggestions are alternatives, not automatic fixes. Preview ranges refer to output, not the original file.`,
     };
     const output = {version: 1, configHash: runtimeConfigHash, versions, baseline: base?.commit ?? (saved ? snapshotRoot : null), profiles: selected, summary, repair, files: outputFiles};
     if (options.format === 'json') process.stdout.write(`${JSON.stringify(output, undefined, 2)}\n`);
@@ -288,6 +297,7 @@ async function main() {
           process.stdout.write(
             `${path.relative(cwd, file.filePath)}:${message.line ?? 1}:${message.column ?? 1} [${message.status}] ${message.ruleId ?? 'eslint'} ${message.message}\n`);
           if (message.documentationPath) process.stdout.write(`  Rule documentation: ${message.documentationPath}\n`);
+          else if (message.documentationUrl) process.stdout.write(`  Rule documentation: ${message.documentationUrl}\n`);
           if (message.fix) process.stdout.write('  Automatic fix available: use --fix or --fix --dry-run.\n');
           const suggestions = message.suggestions ?? [];
           for (const [index, suggestion] of suggestions.entries()) process.stdout.write(

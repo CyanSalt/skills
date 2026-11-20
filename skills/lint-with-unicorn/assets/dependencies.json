@@ -5,13 +5,21 @@
     "diff": "*",
     "tar": "*"
   },
+  "javascript": {
+    "@eslint/js": "*",
+    "globals": "*"
+  },
   "typescript": {
-    "@typescript-eslint/parser": "*",
+    "@eslint/js": "*",
+    "globals": "*",
+    "typescript-eslint": "*",
     "typescript": "^6.0.3"
   },
   "vue": {
+    "@eslint/js": "*",
+    "globals": "*",
     "vue-eslint-parser": "*",
-    "@typescript-eslint/parser": "*",
+    "typescript-eslint": "*",
     "typescript": "^6.0.3"
   },
   "css": {

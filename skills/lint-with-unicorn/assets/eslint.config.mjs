@@ -1,5 +1,4 @@
 import path from 'node:path';
-import {createRequire} from 'node:module';
 import {pathToFileURL} from 'node:url';
 import {patternsFor} from './profiles.mjs';
 
@@ -8,28 +7,28 @@ if (!runtime) {
   throw new Error('Run scripts/lint.mjs to prepare the isolated runtime.');
 }
 
-const require = createRequire(path.join(runtime, 'package.json'));
+const {default: importDependency} = await import(pathToFileURL(path.join(runtime, 'runtime-loader.mjs')).href);
 const selected = new Set(JSON.parse(process.env.UNICORN_LINT_PROFILES ?? '[]'));
 
-async function load(name) {
-  const module = await import(pathToFileURL(require.resolve(name)).href);
-  return module.default ?? module;
-}
-
 // Load optional dependencies only for the selected file types.
-const unicorn = await load('eslint-plugin-unicorn');
-const tsParser = selected.has('typescript') || selected.has('vue')
-  ? await load('@typescript-eslint/parser')
-  : undefined;
-const vueParser = selected.has('vue') ? await load('vue-eslint-parser') : undefined;
-const css = selected.has('css') ? await load('@eslint/css') : undefined;
-const html = selected.has('html') ? await load('@html-eslint/eslint-plugin') : undefined;
-const json = selected.has('json') ? await load('@eslint/json') : undefined;
-const markdown = selected.has('markdown') ? await load('@eslint/markdown') : undefined;
-const toml = selected.has('toml') ? await load('eslint-plugin-toml') : undefined;
-const yml = selected.has('yaml') ? await load('eslint-plugin-yml') : undefined;
+const {defineConfig} = await importDependency('eslint/config');
+const {default: unicorn} = await importDependency('eslint-plugin-unicorn');
+const hasScripts = selected.has('javascript') || selected.has('typescript') || selected.has('vue');
+const js = hasScripts ? (await importDependency('@eslint/js')).default : undefined;
+const globals = hasScripts ? (await importDependency('globals')).default : undefined;
+const tseslint = selected.has('typescript') || selected.has('vue') ? await importDependency('typescript-eslint') : undefined;
+// Scope every official strict block through our outer profile, including Vue and nonstandard suffixes.
+const tsStrict = tseslint?.configs.strict.map(configuration => ({...configuration, files: undefined}));
+const tsParser = tseslint?.parser;
+const vueParser = selected.has('vue') ? (await importDependency('vue-eslint-parser')).default : undefined;
+const css = selected.has('css') ? (await importDependency('@eslint/css')).default : undefined;
+const html = selected.has('html') ? (await importDependency('@html-eslint/eslint-plugin')).default : undefined;
+const json = selected.has('json') ? (await importDependency('@eslint/json')).default : undefined;
+const markdown = selected.has('markdown') ? (await importDependency('@eslint/markdown')).default : undefined;
+const toml = selected.has('toml') ? (await importDependency('eslint-plugin-toml')).default : undefined;
+const yml = selected.has('yaml') ? (await importDependency('eslint-plugin-yml')).default : undefined;
 
-export default [
+export default defineConfig([
   {
     name: 'unicorn-audit/isolation',
     linterOptions: {
@@ -42,10 +41,13 @@ export default [
   // JavaScript and JSX.
   selected.has('javascript') && {
     ...unicorn.configs.recommended,
+    extends: [js.configs.recommended],
     name: 'unicorn-audit/javascript',
     files: patternsFor('javascript'),
     languageOptions: {
       ...unicorn.configs.recommended.languageOptions,
+      // Without project configuration, accept both standard browser and Node globals.
+      globals: {...globals.builtin, ...globals.browser, ...globals.node},
       ecmaVersion: 'latest',
       sourceType: 'module',
       parserOptions: {
@@ -59,10 +61,13 @@ export default [
   // TypeScript, TSX, and declaration files; parsing without a type-checking project.
   selected.has('typescript') && {
     ...unicorn.configs.recommended,
+    extends: [js.configs.recommended, ...tsStrict],
     name: 'unicorn-audit/typescript',
     files: patternsFor('typescript'),
     languageOptions: {
       ...unicorn.configs.recommended.languageOptions,
+      // Without project configuration, accept both standard browser and Node globals.
+      globals: {...globals.builtin, ...globals.browser, ...globals.node},
       ecmaVersion: 'latest',
       sourceType: 'module',
       parser: tsParser,
@@ -80,10 +85,13 @@ export default [
   // Vue scripts use the Vue parser with TypeScript-capable script parsing.
   selected.has('vue') && {
     ...unicorn.configs.recommended,
+    extends: [js.configs.recommended, ...tsStrict],
     name: 'unicorn-audit/vue',
     files: patternsFor('vue'),
     languageOptions: {
       ...unicorn.configs.recommended.languageOptions,
+      // Without project configuration, accept both standard browser and Node globals.
+      globals: {...globals.builtin, ...globals.browser, ...globals.node},
       ecmaVersion: 'latest',
       sourceType: 'module',
       parser: vueParser,
@@ -253,4 +261,4 @@ export default [
       'unicorn/no-top-level-assignment-in-function': 'off',
     },
   },
-].filter(Boolean);
+].filter(Boolean));

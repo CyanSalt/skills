@@ -7,7 +7,7 @@ import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {test} from 'node:test';
 import {classify, lineMapping} from './compare.mjs';
-import {documentationSource, highestStableVersion, resolveDependencies} from './runtime.mjs';
+import {documentationSource, highestStableVersion, resolveDependencies, prepareRuntime} from './runtime.mjs';
 
 const script = fileURLToPath(new URL('lint.mjs', import.meta.url));
 const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), 'unicorn-tests-'));
@@ -140,21 +140,94 @@ if (args[0] === '--version') {
     const runtimes = await readdir(path.join(coldCache, 'runtimes'));
     if (hasPnpm) assert.ok((await readdir(path.join(coldCache, 'runtimes', runtimes[0]))).includes('pnpm-lock.yaml'));
     const installed = JSON.parse(await readFile(path.join(coldCache, 'runtimes', runtimes[0], 'package.json'), 'utf8'));
-    assert.deepEqual(Object.keys(installed.dependencies).toSorted((left, right) => left.localeCompare(right)), ['diff', 'eslint', 'eslint-plugin-unicorn', 'tar']);
+    assert.deepEqual(Object.keys(installed.dependencies).toSorted((left, right) => left.localeCompare(right)), ['@eslint/js', 'diff', 'eslint', 'eslint-plugin-unicorn', 'globals', 'tar']);
     const next = execute(['--no-install', '--', 'sample.js'], environment);
     assert.equal(next.status, 1, next.stderr);
     assert.ok(!next.stderr.includes('Installing isolated dependencies'));
+    const runtime = path.join(coldCache, 'runtimes', runtimes[0]);
+    const loaderFile = path.join(runtime, 'runtime-loader.mjs');
+    const loaderSource = await readFile(new URL('runtime-loader.mjs', import.meta.url), 'utf8');
+    assert.equal(await readFile(loaderFile, 'utf8'), loaderSource);
+    await writeFile(loaderFile, 'throw new Error("Corrupt loader must not execute");\n');
+    const invalidLoader = execute(['--no-install', '--', 'sample.js'], environment);
+    assert.equal(invalidLoader.status, 1, invalidLoader.stderr);
+    assert.ok(!invalidLoader.stderr.includes('Corrupt loader must not execute'));
+    assert.ok(!invalidLoader.stderr.includes('Installing isolated dependencies'));
+    assert.equal(await readFile(loaderFile, 'utf8'), loaderSource);
+    await rm(loaderFile);
+    const missingLoader = execute(['--no-install', '--', 'sample.js'], environment);
+    assert.equal(missingLoader.status, 1, missingLoader.stderr);
+    assert.equal(await readFile(loaderFile, 'utf8'), loaderSource);
+    assert.ok(!missingLoader.stderr.includes('Installing isolated dependencies'));
+    // Replace only disposable fixture dependencies with dual entry points whose require branch fails.
+    const replacements = {
+      diff: 'export default {marker: "default"};\nexport function diffLines(source) { return [{value: source, count: source.split("\\n").length - 1}]; }\n',
+      '@eslint/js': 'export default {configs: {recommended: {rules: {"no-debugger": "error"}}}};\n',
+    };
+    await writeFile(path.join(fixture, 'dual-entry.js'), 'export function debug() { debugger; }\n');
+    try {
+      for (const [name, source] of Object.entries(replacements)) {
+        const directory = path.join(runtime, 'node_modules', name);
+        await rename(directory, `${directory}-original`);
+        await mkdir(directory);
+        await writeFile(path.join(directory, 'package.json'), JSON.stringify({name, version: installed.dependencies[name],
+          type: 'module', exports: {import: './index.mjs', require: './index.cjs'}}));
+        await writeFile(path.join(directory, 'index.mjs'), source);
+        await writeFile(path.join(directory, 'index.cjs'), 'throw new Error("Require branch must not load");\n');
+      }
+      const dualSnapshot = path.join(root, 'dual-entry-before');
+      const snapshot = execute(['--snapshot', dualSnapshot, '--', 'dual-entry.js'], environment);
+      assert.equal(snapshot.status, 0, snapshot.stderr);
+      const dualEntry = execute(['--no-install', '--baseline', dualSnapshot, '--', 'dual-entry.js'], environment);
+      assert.equal(dualEntry.status, 0, dualEntry.stderr);
+      assert.ok(JSON.parse(dualEntry.stdout).files[0].messages.some(message => message.ruleId === 'no-debugger'));
+      const probe = path.join(fixture, 'loader-probe.mjs');
+      await writeFile(probe, `import assert from 'node:assert/strict';
+import {pathToFileURL} from 'node:url';
+const loader = await import(pathToFileURL(process.argv[2]).href);
+assert.deepEqual(Object.keys(loader), ['default']);
+const module = await loader.default('diff');
+assert.equal(module.default.marker, 'default');
+assert.equal(typeof module.diffLines, 'function');
+`);
+      try {
+        const preserved = spawnSync(process.execPath, [probe, loaderFile], {encoding: 'utf8', shell: false});
+        assert.equal(preserved.status, 0, preserved.stderr);
+      } finally {await rm(probe);}
+    } finally {
+      for (const name of Object.keys(replacements)) {
+        const directory = path.join(runtime, 'node_modules', name);
+        await rm(directory, {recursive: true});
+        await rename(`${directory}-original`, directory);
+      }
+      await rm(path.join(fixture, 'dual-entry.js'));
+    }
     const ts = execute(['--', 'sample.ts'], environment);
     assert.equal(ts.status, 1, ts.stderr);
-    assert.match(ts.stderr, /@typescript-eslint\/parser/u);
+    assert.match(ts.stderr, /typescript-eslint/u);
     const tsOffline = execute(['--no-install', '--', 'sample.ts'], environment);
     assert.equal(tsOffline.status, 1, tsOffline.stderr);
     assert.ok(!tsOffline.stderr.includes('Installing isolated dependencies'));
     const extended = JSON.parse(await readFile(path.join(coldCache, 'runtimes', runtimes[0], 'package.json'), 'utf8'));
-    assert.deepEqual(Object.keys(extended.dependencies).toSorted((left, right) => left.localeCompare(right)), ['@typescript-eslint/parser', 'diff', 'eslint', 'eslint-plugin-unicorn', 'tar', 'typescript']);
+    assert.deepEqual(Object.keys(extended.dependencies).toSorted((left, right) => left.localeCompare(right)), ['@eslint/js', 'diff', 'eslint', 'eslint-plugin-unicorn', 'globals', 'tar', 'typescript', 'typescript-eslint']);
     assert.match(extended.dependencies.typescript, /^6\./u);
     const resolutionFile = path.join(coldCache, 'runtimes', runtimes[0], 'resolved-dependencies.json');
     const resolved = JSON.parse(await readFile(resolutionFile, 'utf8'));
+    const manifest = JSON.parse(await readFile(new URL('../assets/dependencies.json', import.meta.url), 'utf8'));
+    const documentConfig = JSON.parse(await readFile(new URL('../assets/documentation.json', import.meta.url), 'utf8'));
+    await Promise.all(Array.from({length: 6}, () => prepareRuntime(runtime, {...manifest.core, ...manifest.javascript}, documentConfig, true)));
+    assert.equal(await readFile(loaderFile, 'utf8'), loaderSource);
+    assert.ok((await readdir(runtime)).every(name => !name.startsWith('.loader-')));
+    await rm(loaderFile);
+    await mkdir(loaderFile);
+    try {
+      const failedCopy = execute(['--no-install', '--', 'sample.js'], environment);
+      assert.equal(failedCopy.status, 2);
+      assert.ok((await readdir(runtime)).every(name => !name.startsWith('.loader-')));
+    } finally {await rm(loaderFile, {recursive: true});}
+    const recoveredCopy = execute(['--no-install', '--', 'sample.js'], environment);
+    assert.equal(recoveredCopy.status, 1, recoveredCopy.stderr);
+    assert.equal(await readFile(loaderFile, 'utf8'), loaderSource);
     assert.equal(resolved.typescript.spec, '^6.0.3');
     assert.equal(resolved.eslint.spec, '*');
     resolved.eslint.spec = 'stale-tag';
@@ -199,16 +272,68 @@ if (args[0] === '--version') {
     assert.equal(output.profiles.length, 9);
     for (const report of output.files) {
       assert.ok(report.messages.every(message => !message.fatal), JSON.stringify(report));
-      assert.ok(report.messages.every(message => message.ruleId?.startsWith('unicorn/')), JSON.stringify(report));
+      assert.ok(report.messages.every(message => typeof message.ruleId === 'string'), JSON.stringify(report));
       for (const message of report.messages) {
-        assert.equal(typeof message.documentationPath, 'string');
-        const documentation = await readFile(message.documentationPath, 'utf8');
-        assert.ok(documentation.length > 0);
+        assert.equal(typeof message.documentationUrl, 'string');
+        if (message.ruleId.startsWith('unicorn/')) {
+          assert.equal(typeof message.documentationPath, 'string');
+          const documentation = await readFile(message.documentationPath, 'utf8');
+          assert.ok(documentation.length > 0);
+        }
       }
       const extension = path.extname(report.filePath);
       if (['.css', '.html', '.htm', '.json', '.jsonc', '.json5', '.md', '.markdown', '.toml', '.yaml', '.yml'].includes(extension)) {
+        assert.ok(report.messages.every(message => message.ruleId.startsWith('unicorn/')), JSON.stringify(report));
         assert.ok(report.messages.some(message => message.ruleId === 'unicorn/prefer-https'), JSON.stringify(report));
       }
+    }
+  });
+  await test('script presets report core and strict findings without type services or non-script leakage', async () => {
+    const source = 'export function check(value: any) { return value!; }\n'
+      + 'export function remove(container: Record<string, unknown>, key: string) { delete container[key]; }\n';
+    const sources = {
+      'core-check.js': 'export function read() { return missingValue; }\n',
+      'core-check.jsx': 'export const view = <div>{missingValue}</div>;\n',
+      'strict-check.ts': source,
+      'strict-check.ctsx': source,
+      'strict-check.mtsx': source,
+      'strict-check.vue': `<script setup lang="ts">\n${source}</script>\n<template><div /></template>\n`,
+      'strict-check-js.vue': '<script>\nconst unusedValue = 1;\n</script>\n<template><div /></template>\n',
+      'strict-check.json': '{"value":1}\n',
+      'strict-check.md': '# Checked document\n',
+    };
+    await writeFile(path.join(fixture, 'tsconfig.json'), 'Invalid project config must not be read');
+    try {
+      for (const [name, content] of Object.entries(sources)) await writeFile(path.join(fixture, name), content);
+      const output = resultOf(['--no-install', '--', ...Object.keys(sources)], 1);
+      for (const report of output.files) {
+        assert.ok(report.messages.every(message => !message.fatal), JSON.stringify(report));
+        const name = path.basename(report.filePath);
+        if (name.startsWith('core-check')) {
+          assert.ok(report.messages.some(message => message.ruleId === 'no-undef'), name);
+          assert.ok(report.messages.every(message => !message.ruleId.startsWith('@typescript-eslint/')), name);
+        } else if (name === 'strict-check-js.vue') {
+          assert.ok(report.messages.some(message => message.ruleId === '@typescript-eslint/no-unused-vars'), name);
+        } else if (['.json', '.md'].includes(path.extname(name))) {
+          assert.equal(report.messages.length, 0, name);
+        } else {
+          for (const rule of ['no-explicit-any', 'no-non-null-assertion', 'no-dynamic-delete']) {
+            assert.ok(report.messages.some(message => message.ruleId === `@typescript-eslint/${rule}`), JSON.stringify(report));
+          }
+          assert.ok(report.messages.every(message => message.ruleId !== 'no-unused-vars'), name);
+        }
+        for (const message of report.messages) {
+          assert.equal(typeof message.documentationUrl, 'string');
+          if (!message.ruleId.startsWith('unicorn/')) assert.equal(message.documentationPath, undefined);
+        }
+      }
+      assert.match(output.repair.nextStep, /independently decide.*worth fixing/u);
+      const text = execute(['--no-install', '--format', 'text', '--', 'core-check.js']);
+      assert.equal(text.status, 1);
+      assert.match(text.stdout, /Rule documentation: https:/u);
+      for (const [name, content] of Object.entries(sources)) assert.equal(await readFile(path.join(fixture, name), 'utf8'), content);
+    } finally {
+      for (const name of [...Object.keys(sources), 'tsconfig.json']) await rm(path.join(fixture, name));
     }
   });
   await test('filename casing is ignored across profiles while other recommended rules still run', async () => {
@@ -232,7 +357,7 @@ if (args[0] === '--version') {
     const names = ['param', 'params', 'prev', 'prop', 'props', 'ref', 'refs',
       'routeParam', 'routeParams', 'prevState', 'someProp', 'someProps', 'someRef', 'someRefs',
       'Param', 'Params', 'Prev', 'Prop', 'Props', 'Ref', 'Refs'];
-    const functionSource = `function audit(${names.join(', ')}) { return [${names.join(', ')}]; }\n`;
+    const functionSource = `function audit(${names.join(', ')}) { return [${names.join(', ')}]; }\nconsole.log(audit);\n`;
     const namingSources = {
       '.vue': `<script setup>\n${functionSource}</script>\n<template><div /></template>\n`,
       '.css': `${names.map(name => `.${name}`).join(', ')} { color: red; }\n`,
@@ -277,7 +402,7 @@ if (args[0] === '--version') {
     } finally {await rm(directory, {recursive: true});}
   });
   await test('intentional module-level state is allowed across JavaScript, TypeScript, and Vue scripts', async () => {
-    const source = 'let sequence = 0;\nfunction next() { sequence++; return sequence; }\n';
+    const source = 'let sequence = 0;\nfunction next() { sequence++; return sequence; }\nconsole.log(next);\n';
     const stateFiles = ['module-state.js', 'module-state.cjs', 'module-state.mjs', 'module-state.jsx',
       'module-state.cjsx', 'module-state.mjsx', 'module-state.ts', 'module-state.cts', 'module-state.mts',
       'module-state.tsx', 'module-state.ctsx', 'module-state.mtsx', 'module-state.vue'];
@@ -295,7 +420,7 @@ if (args[0] === '--version') {
   });
   await test('framework receivers, explicit null values, and conventional documentation remain unchanged', async () => {
     const source = '/**\n * Creates a fresh callback.\n */\nfunction createCallback() { return value => value + 1; }\n'
-      + 'const model = {value: null, read() { return this.value; }};\n';
+      + 'const model = {value: null, read() { return this.value; }};\nconsole.log(model, createCallback);\n';
     const extensions = ['.js', '.cjs', '.mjs', '.jsx', '.cjsx', '.mjsx', '.ts', '.cts', '.mts', '.tsx', '.ctsx', '.mtsx'];
     const sources = Object.fromEntries(extensions.map(extension => [`framework-contract${extension}`, source]));
     Object.assign(sources, {
@@ -348,6 +473,16 @@ if (args[0] === '--version') {
     assert.equal(await readFile(path.join(fixture, 'isolated.js'), 'utf8'), `/* eslint-disable */\n${code}`);
     const projectEntries = await readdir(fixture);
     assert.ok(!projectEntries.includes('node_modules'));
+    const shadowDependencies = path.join(fixture, 'node_modules');
+    for (const name of ['diff', '@eslint/js', 'eslint-plugin-unicorn']) {
+      const directory = path.join(shadowDependencies, name);
+      await mkdir(directory, {recursive: true});
+      await writeFile(path.join(directory, 'package.json'), JSON.stringify({name, type: 'module', exports: './index.mjs'}));
+      await writeFile(path.join(directory, 'index.mjs'), 'throw new Error("Project dependency must not load");\n');
+    }
+    try {
+      resultOf(['--no-install', '--', 'isolated.js'], 1);
+    } finally {await rm(shadowDependencies, {recursive: true});}
     assert.ok(!projectEntries.includes('.eslintcache'));
     await writeFile(path.join(fixture, '.eslintcache'), 'Preserve the project cache');
     resultOf(['--no-install', '--no-cache', '--', 'isolated.js'], 1);
